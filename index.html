@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="{{SITE_LANGUAGE}}">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="{{FAVICON_PATH}}" />
+    <link rel="apple-touch-icon" href="{{SITE_IMAGE_URL}}" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>{{SITE_TITLE}}</title>
+    <meta name="description" content="{{SITE_DESCRIPTION}}" />
+    
+    <!-- Open Graph / Telegram / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="{{SITE_URL}}" />
+    <meta property="og:site_name" content="{{SITE_NAME}}" />
+    <meta property="og:title" content="{{SITE_TITLE}}" />
+    <meta property="og:description" content="{{SITE_DESCRIPTION}}" />
+    <meta property="og:image" content="{{SITE_IMAGE_URL}}" />
+    <meta property="og:image:secure_url" content="{{SITE_IMAGE_URL}}" />
+    <meta property="og:image:type" content="{{SITE_IMAGE_TYPE}}" />
+    <meta property="og:image:width" content="{{SITE_IMAGE_WIDTH}}" />
+    <meta property="og:image:height" content="{{SITE_IMAGE_HEIGHT}}" />
+    <meta property="og:image:alt" content="{{SITE_IMAGE_ALT}}" />
+
+    <!-- Twitter / Discord Card -->
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="{{SITE_TITLE}}" />
+    <meta name="twitter:description" content="{{SITE_DESCRIPTION}}" />
+    <meta name="twitter:image" content="{{SITE_IMAGE_URL}}" />
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

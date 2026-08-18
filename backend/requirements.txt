@@ -1,0 +1,2 @@
+# Built with standard Python 3.10+ standard libraries (http.server, sqlite3, urllib, json, hashlib)
+# No external pip dependencies required!

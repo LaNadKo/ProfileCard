@@ -1,0 +1,32 @@
+export const profileData = {
+  personal: {
+    name: "",
+    nickname: "",
+    alias: "",
+    handle: "",
+    role: "",
+    location: "",
+    timezone: "UTC",
+    timezoneOffset: 0,
+    discordUserId: "",
+    avatar: "/avatar.jpg",
+    videoAvatar: "/video_bg.mp4",
+    videoPoster: "/poster.jpg",
+    bio: "",
+    canonicalUrl: "",
+  },
+  weather: {
+    latitude: null,
+    longitude: null,
+    timezone: "UTC",
+    locationLabel: "",
+    apiUrl: "",
+  },
+  guestbook: {
+    allowedReactions: [],
+    maxNameLength: 50,
+    maxMessageLength: 300,
+  },
+  socials: [],
+  projects: [],
+};

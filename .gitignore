@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+dist/
+dist-ssr/
+
+# Environment variables & secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_*
+
+# Python & SQLite databases
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor & OS files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.local
+*.sw?
+
+# Runtime-generated privacy secret
+backend/.ip_hash_secret
+backend/projects.json

@@ -1,0 +1,15 @@
+{$SITE_ADDRESS} {
+    encode gzip zstd
+
+    # Route backend API to Python server on port 8095
+    handle /api/* {
+        reverse_proxy {$BACKEND_ADDRESS}
+    }
+
+    # Static Single Page App (Frontend)
+    handle {
+        root * {$FRONTEND_ROOT}
+        try_files {path} /index.html
+        file_server
+    }
+}

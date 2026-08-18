@@ -1,0 +1,15 @@
+[Unit]
+Description=ProfileCard backend service
+After=network.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__BACKEND_DIRECTORY__
+ExecStart=/usr/bin/python3 __BACKEND_DIRECTORY__/server.py
+Restart=always
+RestartSec=5
+EnvironmentFile=__BACKEND_DIRECTORY__/.env
+
+[Install]
+WantedBy=multi-user.target

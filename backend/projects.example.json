@@ -1,0 +1,14 @@
+[
+  {
+    "id": "example-project",
+    "title": "Example Project",
+    "description": "Project description",
+    "tags": ["Technology"],
+    "stars": 0,
+    "statusBadge": "Active",
+    "statusType": "active",
+    "isPrivate": false,
+    "link": "https://github.com/your_username/example-project",
+    "demo": null
+  }
+]
