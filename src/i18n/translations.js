@@ -84,7 +84,7 @@ export const translations = {
     },
     terminal: {
       titleBar: 'guest@lanadkopi: ~ (whoami-cli)',
-      welcome: 'Добро пожаловать в whoami-cli v2.5.0! Введите "help" для списка доступных команд.',
+      welcome: 'Добро пожаловать в whoami-cli! Введите "help" для списка доступных команд.',
       placeholder: 'Введите команду (например, "help", "neofetch", "snake")...',
       closeTitle: 'Закрыть (ESC)',
       minimizeTitle: 'Свернуть',
@@ -168,7 +168,7 @@ export const translations = {
     },
     terminal: {
       titleBar: 'guest@lanadkopi: ~ (whoami-cli)',
-      welcome: 'Welcome to whoami-cli v2.5.0! Type "help" for a list of available commands.',
+      welcome: 'Welcome to whoami-cli! Type "help" for a list of available commands.',
       placeholder: 'Type a command (e.g. "help", "neofetch", "snake")...',
       closeTitle: 'Close (ESC)',
       minimizeTitle: 'Minimize',

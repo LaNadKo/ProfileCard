@@ -738,7 +738,7 @@
   background: #ffffff;
   border-radius: 3px;
   box-shadow: 0 0 6px rgba(255, 255, 255, 0.7);
-  transition: none;
+  transition: width 100ms linear;
   will-change: width;
 }
 

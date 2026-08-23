@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { apiUrl, appConfig, lanyardUserUrl } from '../config/appConfig';
+import { useSmartPolling } from './useSmartPolling';
 
 export const formatTelegramLastSeen = (lastSeenSec, lang = 'ru') => {
   const isEn = lang === 'en';
@@ -96,37 +97,29 @@ export function usePresence({ discordUserId, lang = 'ru' }) {
 
   const [lastSeenTimestamp, setLastSeenTimestamp] = useState(null);
 
-  // 1. Direct Autonomous Spotify Web API
-  useEffect(() => {
-    let isMounted = true;
-
-    const fetchSpotify = async () => {
-      try {
-        const res = await fetch(apiUrl('spotify/playing', { _t: Date.now() }));
-        if (!res.ok) return;
-        const data = await res.json();
-        if (isMounted) {
-          setSpotifyState({
-            isPlaying: Boolean(data.isPlaying),
-            data: data.isPlaying ? data : null,
-            lastPlayed: data.lastPlayed || null,
-            loaded: true,
-          });
-        }
-      } catch {
-        if (isMounted) {
-          setSpotifyState((prev) => ({ ...prev, loaded: true }));
-        }
+  // 1. Direct Autonomous Spotify Web API with Smart Polling
+  const pollSpotify = useCallback(async ({ signal }) => {
+    try {
+      const res = await fetch(apiUrl('spotify/playing', { _t: Date.now() }), { signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      setSpotifyState({
+        isPlaying: Boolean(data.isPlaying),
+        data: data.isPlaying ? data : null,
+        lastPlayed: data.lastPlayed || null,
+        loaded: true,
+      });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setSpotifyState((prev) => ({ ...prev, loaded: true }));
       }
-    };
-
-    fetchSpotify();
-    const interval = setInterval(fetchSpotify, appConfig.polling.spotifyMs);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
+    }
   }, []);
+
+  useSmartPolling(pollSpotify, {
+    interval: appConfig.polling.spotifyMs || 5000,
+    maxBackoff: 30000,
+  });
 
   // 2. Real-Time Discord Gateway via Lanyard
   useEffect(() => {
@@ -218,30 +211,24 @@ export function usePresence({ discordUserId, lang = 'ru' }) {
     };
   }, [discordUserId]);
 
-  // 3. Last-Seen Server Fetch
-  useEffect(() => {
-    let isMounted = true;
-
-    const fetchLastSeen = async () => {
-      try {
-        const res = await fetch(apiUrl('last-seen', { _t: Date.now() }));
-        if (!res.ok) return;
-        const data = await res.json();
-        if (isMounted && data && data.lastSeenTimestamp) {
-          setLastSeenTimestamp(data.lastSeenTimestamp);
-        }
-      } catch {
-        // Fallback to local
+  // 3. Last-Seen Server Fetch with Smart Polling
+  const pollLastSeen = useCallback(async ({ signal }) => {
+    try {
+      const res = await fetch(apiUrl('last-seen', { _t: Date.now() }), { signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.lastSeenTimestamp) {
+        setLastSeenTimestamp(data.lastSeenTimestamp);
       }
-    };
-
-    fetchLastSeen();
-    const interval = setInterval(fetchLastSeen, appConfig.polling.lastSeenMs);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
+    } catch {
+      // Fallback to local
+    }
   }, []);
+
+  useSmartPolling(pollLastSeen, {
+    interval: appConfig.polling.lastSeenMs || 15000,
+    maxBackoff: 30000,
+  });
 
   // Combined Presence Computation
   const isOnline = discordState.online || spotifyState.isPlaying || Boolean(discordState.game);

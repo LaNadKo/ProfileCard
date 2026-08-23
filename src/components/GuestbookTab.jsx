@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Send, MessageSquare, Clock, CheckCircle2 } from 'lucide-react';
 import { apiUrl, appConfig, storageKey } from '../config/appConfig';
 import { useI18n } from '../i18n/translations';
+import { useSmartPolling } from '../hooks/useSmartPolling';
 
 const containsLink = (str) => {
   if (!str) return false;
@@ -9,7 +10,7 @@ const containsLink = (str) => {
   return urlPattern.test(str);
 };
 
-export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang }) => {
+export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang, isActive = true }) => {
   const { t } = useI18n(lang);
   const allowedReactions = Array.isArray(config.allowedReactions) ? config.allowedReactions : [];
   const maxNameLength = Number(config.maxNameLength) || 50;
@@ -34,9 +35,9 @@ export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang }) =>
     return d.toLocaleDateString(t.locale, { day: 'numeric', month: 'short' });
   };
 
-  const fetchMessages = useCallback(async () => {
+  const fetchMessages = useCallback(async ({ signal } = {}) => {
     try {
-      const res = await fetch(apiUrl('guestbook', { _t: Date.now() }));
+      const res = await fetch(apiUrl('guestbook', { _t: Date.now() }), { signal });
       if (res.ok) {
         const data = await res.json();
         const msgList = data.messages || [];
@@ -51,30 +52,21 @@ export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang }) =>
           localStorage.removeItem(storageKey('guestbook_posted'));
         }
       }
-    } catch {
-      const local = localStorage.getItem(storageKey('guestbook_posted')) === 'true';
-      setHasPosted(local);
+    } catch (err) {
+      if (err?.name !== 'AbortError') {
+        const local = localStorage.getItem(storageKey('guestbook_posted')) === 'true';
+        setHasPosted(local);
+      }
     } finally {
       setIsLoading(false);
     }
   }, [onCountChange]);
 
-  useEffect(() => {
-    fetchMessages();
-    const interval = setInterval(fetchMessages, appConfig.polling.guestbookMs);
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        fetchMessages();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-
-    return () => {
-      clearInterval(interval);
-      document.removeEventListener('visibilitychange', handleVisibility);
-    };
-  }, [fetchMessages]);
+  useSmartPolling(fetchMessages, {
+    interval: appConfig.polling.guestbookMs || 20000,
+    maxBackoff: 60000,
+    enabled: isActive,
+  });
 
   const handleReact = async (messageId, emoji) => {
     try {
@@ -88,6 +80,8 @@ export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang }) =>
         if (data.messages) {
           setMessages(data.messages);
         }
+      } else if (res.status === 429) {
+        showToast('Too many reactions. Please wait.');
       }
     } catch {
       showToast('Error setting reaction');
@@ -239,15 +233,17 @@ export const GuestbookTab = ({ showToast, onCountChange, config = {}, lang }) =>
               {/* Emoji Reaction Bar */}
               <div className="guestbook-reactions-row">
                 {allowedReactions.map((emoji) => {
-                  const count = m.reactions?.[emoji] || 0;
-                  const isUserReacted = m.userReactions?.includes(emoji);
+                  const reaction = m.reactions?.[emoji];
+                  const count = Number(reaction?.count ?? (typeof reaction === 'number' ? reaction : 0));
+                  const isUserReacted = Boolean(reaction?.userReacted || (Array.isArray(m.userReactions) && m.userReactions.includes(emoji)));
+
                   return (
                     <button
                       key={emoji}
                       type="button"
-                      className={`reaction-pill-btn ${isUserReacted ? 'reaction-pill-active' : ''} ${count > 0 ? 'reaction-pill-has-count' : ''}`}
+                      className={`guestbook-reaction-chip ${isUserReacted ? 'active' : ''}`}
                       onClick={() => handleReact(m.id, emoji)}
-                      title={`React with ${emoji}`}
+                      title={`${emoji} (${count})`}
                     >
                       <span className="reaction-emoji">{emoji}</span>
                       {count > 0 && <span className="reaction-count font-mono">{count}</span>}

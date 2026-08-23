@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-whoami Unified Backend Daemon
------------------------------
+whoami Unified Identity Backend Daemon
+---------------------------------------
 Features:
-- Autonomous Spotify Web API Presence with 1-min last-played cache
-- Telegram-style Last-Seen tracking
-- Real-time CPU / RAM / Disk / OS system metrics
-- Unique IP visits counter and recent visitors ledger
-- Live concurrent visitors heartbeat counter (2.5s window)
-- SQLite persistent Guestbook with rate limiting, anti-spam & reactions
+- Autonomous Spotify Web API Presence with Single-Flight SWR and failure backoff
+- Telegram-style Last-Seen tracking with multi-source fallback
+- Real-time Public System Telemetry DTO
+- Deduplicated & throttled /api/visit tracking (204 No Content)
+- Live active concurrent visitors heartbeat counter (5s window / 15s TTL)
+- SQLite WAL persistent Guestbook with bounded rate limiting, anti-spam & reactions
+- Internal health and readiness endpoints (/health/live, /health/ready)
 """
 
 import http.server
-import socketserver
 import urllib.parse
 import urllib.request
 import base64
@@ -22,15 +22,23 @@ import os
 import sqlite3
 import hashlib
 import hmac
-import html
 import re
 import threading
+import collections
 import platform
 import socket
 import secrets
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-# Load environment variables from .env file if present
+# Setup structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("whoami-backend")
+
 def load_dotenv(dotenv_path=".env"):
     if not os.path.exists(dotenv_path):
         return
@@ -46,7 +54,12 @@ def load_dotenv(dotenv_path=".env"):
                 os.environ[k] = v
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BACKEND_DIR, ".env"))
+# Check state directory or local env
+STATE_DIR = os.environ.get("STATE_DIR", os.path.join(BACKEND_DIR, "state"))
+if os.path.exists(os.path.join(STATE_DIR, ".env")):
+    load_dotenv(os.path.join(STATE_DIR, ".env"))
+else:
+    load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
 def env_int(name, default):
     try:
@@ -75,9 +88,16 @@ def optional_float(value):
 def env_csv(name, default=""):
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
-DB_PATH = os.environ.get("DB_PATH", os.path.join(BACKEND_DIR, "data.db"))
+# Configuration paths & constants
+DB_PATH = os.environ.get("DB_PATH")
+if not DB_PATH:
+    if os.path.exists(STATE_DIR):
+        DB_PATH = os.path.join(STATE_DIR, "data.db")
+    else:
+        DB_PATH = os.path.join(BACKEND_DIR, "data.db")
 if not os.path.isabs(DB_PATH):
     DB_PATH = os.path.join(BACKEND_DIR, DB_PATH)
+
 PORT = env_int("PORT", 8095)
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0").strip()
 CORS_ALLOWED_ORIGINS = set(env_csv("CORS_ALLOWED_ORIGINS"))
@@ -86,27 +106,31 @@ CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
 DISCORD_USER_ID = os.environ.get("DISCORD_USER_ID", "")
+
 IP_HASH_SECRET = os.environ.get("IP_HASH_SECRET", "").encode("utf-8")
-IP_HASH_SECRET_FILE = os.environ.get(
-    "IP_HASH_SECRET_FILE",
-    os.path.join(BACKEND_DIR, ".ip_hash_secret")
-)
+IP_HASH_SECRET_FILE = os.environ.get("IP_HASH_SECRET_FILE")
+if not IP_HASH_SECRET_FILE:
+    if os.path.exists(STATE_DIR):
+        IP_HASH_SECRET_FILE = os.path.join(STATE_DIR, ".ip_hash_secret")
+    else:
+        IP_HASH_SECRET_FILE = os.path.join(BACKEND_DIR, ".ip_hash_secret")
 if not os.path.isabs(IP_HASH_SECRET_FILE):
     IP_HASH_SECRET_FILE = os.path.join(BACKEND_DIR, IP_HASH_SECRET_FILE)
 
-ALLOWED_EMOJIS = env_csv("GUESTBOOK_ALLOWED_REACTIONS")
+ALLOWED_EMOJIS = env_csv("GUESTBOOK_ALLOWED_REACTIONS", "❤️,🔥,👍,🎉,🚀,✨")
 GUESTBOOK_MAX_NAME_LENGTH = env_int("GUESTBOOK_MAX_NAME_LENGTH", 50)
 GUESTBOOK_MAX_MESSAGE_LENGTH = env_int("GUESTBOOK_MAX_MESSAGE_LENGTH", 300)
 GUESTBOOK_RESERVED_NAMES = {
     value.lower()
-    for value in env_csv("GUESTBOOK_RESERVED_NAMES")
+    for value in env_csv("GUESTBOOK_RESERVED_NAMES", "admin,owner,mechtatel,lanadko,root,system")
 }
-ACTIVE_VISITOR_TTL_SECONDS = env_float("ACTIVE_VISITOR_TTL_SECONDS", 8.0)
+ACTIVE_VISITOR_TTL_SECONDS = env_float("ACTIVE_VISITOR_TTL_SECONDS", 15.0)
 VISIT_SESSION_SECONDS = env_int("VISIT_SESSION_SECONDS", 1800)
 SPOTIFY_LAST_PLAYED_TTL_SECONDS = env_int("SPOTIFY_LAST_PLAYED_TTL_SECONDS", 60)
 GITHUB_CACHE_TTL_SECONDS = env_int("GITHUB_CACHE_TTL_SECONDS", 600)
 SYSTEM_DISK_PATH = os.environ.get("SYSTEM_DISK_PATH", os.path.abspath(os.sep))
-MAX_REQUEST_BYTES = env_int("MAX_REQUEST_BYTES", 10000)
+MAX_JSON_BODY_BYTES = env_int("MAX_JSON_BODY_BYTES", 16 * 1024)
+EXTERNAL_API_TIMEOUT = env_float("EXTERNAL_API_TIMEOUT", 4.0)
 LAST_SEEN_FALLBACK_SECONDS = env_int("LAST_SEEN_FALLBACK_SECONDS", 3600)
 SPOTIFY_TOKEN_URL = os.environ.get("SPOTIFY_TOKEN_URL", "https://accounts.spotify.com/api/token").strip()
 SPOTIFY_CURRENTLY_PLAYING_URL = os.environ.get(
@@ -116,7 +140,6 @@ SPOTIFY_CURRENTLY_PLAYING_URL = os.environ.get(
 LANYARD_REST_BASE_URL = os.environ.get("LANYARD_REST_BASE_URL", "https://api.lanyard.rest/v1/users").rstrip("/")
 OUTBOUND_USER_AGENT = os.environ.get("OUTBOUND_USER_AGENT", "ProfileCard").strip()
 
-# Excluded IP addresses from analytics & live visitors counter (configured via .env)
 ALL_EXCLUDED_IPS = set(x.strip() for x in os.environ.get("EXCLUDED_IPS", "").split(",") if x.strip())
 
 def get_ip_hash_secret():
@@ -130,6 +153,7 @@ def get_ip_hash_secret():
                 IP_HASH_SECRET = f.read().strip()
         else:
             IP_HASH_SECRET = secrets.token_hex(32).encode("ascii")
+            os.makedirs(os.path.dirname(IP_HASH_SECRET_FILE), exist_ok=True)
             with open(IP_HASH_SECRET_FILE, "xb") as f:
                 f.write(IP_HASH_SECRET)
             try:
@@ -169,20 +193,18 @@ def is_excluded_ip(ip_str):
 def is_local_or_private_ip(ip_str):
     return is_excluded_ip(ip_str)
 
-# In-memory Active Live Visitors Tracker (Device ID + IP keyed)
+# In-memory Active Live Visitors Tracker (5s polling, 15s TTL)
 visitors_lock = threading.Lock()
 ACTIVE_VISITORS = {}  # visitor_key -> last_seen_ts
 
 def record_visitor_heartbeat(client_ip, visitor_id=None):
     now = time.time()
     with visitors_lock:
-        # Active window: 8 seconds TTL
         cutoff = now - ACTIVE_VISITOR_TTL_SECONDS
         expired = [k for k, ts in ACTIVE_VISITORS.items() if ts < cutoff]
         for k in expired:
             del ACTIVE_VISITORS[k]
 
-        # Ignore local/private and blacklisted network addresses completely
         if not client_ip or is_excluded_ip(client_ip):
             return len(ACTIVE_VISITORS)
 
@@ -196,47 +218,57 @@ def record_visitor_heartbeat(client_ip, visitor_id=None):
 
         return len(ACTIVE_VISITORS)
 
-# SQLite DB Initializer
+# Central SQLite connection helper
+def open_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=3.0)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=3000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS guestbook (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip_hash TEXT UNIQUE,
-            name TEXT NOT NULL,
-            text TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS guestbook_reactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER NOT NULL,
-            ip_hash TEXT NOT NULL,
-            emoji TEXT NOT NULL,
-            UNIQUE(message_id, ip_hash, emoji)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS presence_state (
-            key TEXT PRIMARY KEY,
-            val TEXT NOT NULL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS unique_visits (
-            ip_hash TEXT PRIMARY KEY,
-            masked_ip TEXT NOT NULL,
-            device TEXT NOT NULL,
-            first_seen INTEGER NOT NULL,
-            last_seen INTEGER NOT NULL,
-            visits_count INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS guestbook (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_hash TEXT UNIQUE,
+                name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS guestbook_reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                ip_hash TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                UNIQUE(message_id, ip_hash, emoji)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS presence_state (
+                key TEXT PRIMARY KEY,
+                val TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS unique_visits (
+                ip_hash TEXT PRIMARY KEY,
+                masked_ip TEXT NOT NULL,
+                device TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                visits_count INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_unique_visits_last_seen ON unique_visits(last_seen)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_guestbook_created_at ON guestbook(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_guestbook_reactions_message ON guestbook_reactions(message_id)")
 
 init_db()
 
@@ -281,37 +313,54 @@ def parse_user_agent(ua_str):
 
     return f"{os_name} • {browser}"
 
+# Throttled / Deduplicated Visit Recording
+VISIT_TOUCH_TTL = 60
+visit_touch_cache = {}
+visit_touch_lock = threading.Lock()
+
+def should_touch_visit(visitor_key):
+    now = time.monotonic()
+    with visit_touch_lock:
+        if len(visit_touch_cache) > 10_000:
+            stale = [k for k, ts in visit_touch_cache.items() if now - ts > VISIT_TOUCH_TTL * 2]
+            for k in stale:
+                del visit_touch_cache[k]
+        previous = visit_touch_cache.get(visitor_key, 0.0)
+        if now - previous < VISIT_TOUCH_TTL:
+            return False
+        visit_touch_cache[visitor_key] = now
+        return True
+
 def record_unique_visit(client_ip, user_agent):
     if not client_ip or is_local_or_private_ip(client_ip):
         return
+    visitor_key = hash_identifier(client_ip, "visit-throttle")
+    if not should_touch_visit(visitor_key):
+        return
+
     ip_hash = hash_identifier(client_ip, "analytics")
     masked = mask_ip(client_ip)
     device = parse_user_agent(user_agent)
     now = int(time.time())
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT last_seen, visits_count FROM unique_visits WHERE ip_hash = ?", (ip_hash,))
-        row = c.fetchone()
-        if row:
-            last_seen_ts = row[0]
-            # Session window: only increment visits_count if > 30 minutes (1800s) since last activity
-            increment = 1 if (now - last_seen_ts > VISIT_SESSION_SECONDS) else 0
-            c.execute("""
-                UPDATE unique_visits
-                SET last_seen = ?, visits_count = visits_count + ?, device = ?
-                WHERE ip_hash = ?
-            """, (now, increment, device, ip_hash))
-        else:
-            c.execute("""
-                INSERT INTO unique_visits (ip_hash, masked_ip, device, first_seen, last_seen, visits_count)
-                VALUES (?, ?, ?, ?, ?, 1)
-            """, (ip_hash, masked, device, now, now))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
+        with open_db() as conn:
+            row = conn.execute("SELECT last_seen, visits_count FROM unique_visits WHERE ip_hash = ?", (ip_hash,)).fetchone()
+            if row:
+                last_seen_ts = row["last_seen"]
+                increment = 1 if (now - last_seen_ts > VISIT_SESSION_SECONDS) else 0
+                conn.execute("""
+                    UPDATE unique_visits
+                    SET last_seen = ?, visits_count = visits_count + ?, device = ?
+                    WHERE ip_hash = ?
+                """, (now, increment, device, ip_hash))
+            else:
+                conn.execute("""
+                    INSERT INTO unique_visits (ip_hash, masked_ip, device, first_seen, last_seen, visits_count)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                """, (ip_hash, masked, device, now, now))
+    except Exception as e:
+        logger.exception("Failed to record unique visit: %s", e)
 
 def get_visits_stats():
     now = int(time.time())
@@ -328,48 +377,43 @@ def get_visits_stats():
     ]
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        ex_placeholders = ",".join("?" * len(excluded_hashes)) if excluded_hashes else "''"
-        params = list(excluded_hashes)
+        with open_db() as conn:
+            ex_placeholders = ",".join("?" * len(excluded_hashes)) if excluded_hashes else "''"
+            params = list(excluded_hashes)
 
-        where_clause = f"""
-            WHERE masked_ip NOT LIKE '192.168.%' 
-              AND masked_ip NOT LIKE '127.%' 
-              AND masked_ip NOT LIKE '10.%'
-              AND ip_hash NOT IN ({ex_placeholders})
-        """
+            where_clause = f"""
+                WHERE masked_ip NOT LIKE '192.168.%' 
+                  AND masked_ip NOT LIKE '127.%' 
+                  AND masked_ip NOT LIKE '10.%'
+                  AND ip_hash NOT IN ({ex_placeholders})
+            """
 
-        c.execute(f"SELECT COUNT(*), SUM(visits_count) FROM unique_visits {where_clause}", params)
-        row = c.fetchone()
-        if row:
-            total_unique = row[0] or 0
-            total_views = row[1] or 0
+            row = conn.execute(f"SELECT COUNT(*), SUM(visits_count) FROM unique_visits {where_clause}", params).fetchone()
+            if row:
+                total_unique = row[0] or 0
+                total_views = row[1] or 0
 
-        c.execute(f"SELECT COUNT(*) FROM unique_visits {where_clause} AND last_seen >= ?", params + [today_start])
-        row_today = c.fetchone()
-        if row_today:
-            today_unique = row_today[0] or 0
+            row_today = conn.execute(f"SELECT COUNT(*) FROM unique_visits {where_clause} AND last_seen >= ?", params + [today_start]).fetchone()
+            if row_today:
+                today_unique = row_today[0] or 0
 
-        c.execute(f"""
-            SELECT masked_ip, device, first_seen, last_seen, visits_count
-            FROM unique_visits
-            {where_clause}
-            ORDER BY last_seen DESC
-            LIMIT 15
-        """, params)
-        for r in c.fetchall():
-            recent.append({
-                "maskedIp": r[0],
-                "device": r[1],
-                "firstSeen": r[2],
-                "lastSeen": r[3],
-                "visitsCount": r[4]
-            })
-        conn.close()
-    except Exception:
-        pass
+            rows = conn.execute(f"""
+                SELECT masked_ip, device, first_seen, last_seen, visits_count
+                FROM unique_visits
+                {where_clause}
+                ORDER BY last_seen DESC
+                LIMIT 15
+            """, params).fetchall()
+            for r in rows:
+                recent.append({
+                    "maskedIp": r["masked_ip"],
+                    "device": r["device"],
+                    "firstSeen": r["first_seen"],
+                    "lastSeen": r["last_seen"],
+                    "visitsCount": r["visits_count"]
+                })
+    except Exception as e:
+        logger.exception("Failed to get visits stats: %s", e)
 
     return {
         "totalUnique": total_unique,
@@ -390,16 +434,13 @@ def get_my_session(client_ip, user_agent):
     first_seen = now
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT first_seen, visits_count FROM unique_visits WHERE ip_hash = ?", (ip_hash,))
-        row = c.fetchone()
-        if row:
-            first_seen = row[0]
-            visits_count = row[1]
-        conn.close()
-    except Exception:
-        pass
+        with open_db() as conn:
+            row = conn.execute("SELECT first_seen, visits_count FROM unique_visits WHERE ip_hash = ?", (ip_hash,)).fetchone()
+            if row:
+                first_seen = row["first_seen"]
+                visits_count = row["visits_count"]
+    except Exception as e:
+        logger.exception("Failed to get session: %s", e)
 
     return {
         "ip": masked,
@@ -439,45 +480,49 @@ def get_spotify_access_token():
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=EXTERNAL_API_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
             cached_spotify_token = data.get("access_token")
             expires_in = data.get("expires_in", 3600)
             spotify_token_expires_at = now + expires_in
             return cached_spotify_token
     except Exception as e:
-        print(f"Error refreshing access token: {e}")
+        logger.warning("Error refreshing spotify access token: %s", e)
         return None
 
 def get_cached_last_played():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT val FROM presence_state WHERE key = 'last_played_track'")
-        row = c.fetchone()
-        conn.close()
-        if row:
-            data = json.loads(row[0])
-            # TTL: 1 minute (60 seconds)
-            played_at = data.get("playedAtTimestamp", 0)
-            if time.time() - played_at <= SPOTIFY_LAST_PLAYED_TTL_SECONDS:
-                return data
-    except Exception:
-        pass
+        with open_db() as conn:
+            row = conn.execute("SELECT val FROM presence_state WHERE key = 'last_played_track'").fetchone()
+            if row:
+                data = json.loads(row["val"])
+                played_at = data.get("playedAtTimestamp", 0)
+                if time.time() - played_at <= SPOTIFY_LAST_PLAYED_TTL_SECONDS:
+                    return data
+    except Exception as e:
+        logger.warning("Error reading cached last played: %s", e)
     return None
 
 def save_last_played(track_dict):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        val_str = json.dumps(track_dict)
-        c.execute("INSERT INTO presence_state (key, val) VALUES ('last_played_track', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (val_str, val_str))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
+        with open_db() as conn:
+            val_str = json.dumps(track_dict)
+            conn.execute("INSERT INTO presence_state (key, val) VALUES ('last_played_track', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (val_str, val_str))
+    except Exception as e:
+        logger.warning("Error saving last played track: %s", e)
 
-def get_spotify_status():
+# Single-Flight Stale-While-Revalidate Spotify Cache with Exponential Failure Backoff
+spotify_cache = {
+    "value": None,
+    "updated_at": 0.0,
+    "refreshing": False,
+    "fail_count": 0,
+    "next_retry_at": 0.0,
+}
+spotify_lock = threading.Lock()
+refresh_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nexus-cache")
+
+def fetch_spotify_direct():
     token = get_spotify_access_token()
     last_played = get_cached_last_played()
 
@@ -492,93 +537,124 @@ def get_spotify_status():
         }
     )
 
+    with urllib.request.urlopen(req, timeout=EXTERNAL_API_TIMEOUT) as resp:
+        if resp.status in (204, 202):
+            return {"isPlaying": False, "lastPlayed": last_played}
+        body = resp.read().decode()
+        if not body:
+            return {"isPlaying": False, "lastPlayed": last_played}
+
+        data = json.loads(body)
+        is_playing = data.get("is_playing", False)
+        item = data.get("item")
+
+        if not is_playing or not item:
+            return {"isPlaying": False, "lastPlayed": last_played}
+
+        artists = ", ".join([a.get("name", "") for a in item.get("artists", [])])
+        song = item.get("name", "")
+        album = item.get("album", {}).get("name", "")
+        images = item.get("album", {}).get("images", [])
+        album_art_url = images[0].get("url") if images else None
+        track_id = item.get("id")
+        track_uri = item.get("uri") or (f"spotify:track:{track_id}" if track_id else None)
+        track_url = item.get("external_urls", {}).get("spotify")
+
+        track_info = {
+            "isPlaying": True,
+            "song": song,
+            "artist": artists,
+            "album": album,
+            "albumArtUrl": album_art_url,
+            "trackId": track_id,
+            "trackUri": track_uri,
+            "trackUrl": track_url,
+            "title": f"{song} — {artists}" if artists else song,
+            "progressMs": data.get("progress_ms", 0),
+            "durationMs": item.get("duration_ms", 0),
+            "playedAtTimestamp": int(time.time()),
+        }
+
+        save_last_played(track_info)
+        now_ts = int(time.time())
+        try:
+            with open_db() as conn:
+                conn.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now_ts), str(now_ts)))
+        except Exception as e:
+            logger.warning("Error saving presence state: %s", e)
+        return track_info
+
+def refresh_spotify_worker():
+    global spotify_cache
+    new_val = None
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 204 or resp.status == 202:
-                return {"isPlaying": False, "lastPlayed": last_played}
-            body = resp.read().decode()
-            if not body:
-                return {"isPlaying": False, "lastPlayed": last_played}
+        new_val = fetch_spotify_direct()
+    except Exception as e:
+        logger.warning("Background Spotify refresh warning: %s", e)
 
-            data = json.loads(body)
-            is_playing = data.get("is_playing", False)
-            item = data.get("item")
+    now = time.monotonic()
+    with spotify_lock:
+        spotify_cache["refreshing"] = False
+        if new_val is not None:
+            spotify_cache["value"] = new_val
+            spotify_cache["updated_at"] = now
+            spotify_cache["fail_count"] = 0
+            spotify_cache["next_retry_at"] = 0.0
+        else:
+            spotify_cache["fail_count"] += 1
+            delay = min(5.0 * (2 ** (spotify_cache["fail_count"] - 1)), 60.0)
+            spotify_cache["next_retry_at"] = now + delay
 
-            if not is_playing or not item:
-                return {"isPlaying": False, "lastPlayed": last_played}
+def get_spotify_status():
+    now = time.monotonic()
+    with spotify_lock:
+        val = spotify_cache["value"]
+        updated_at = spotify_cache["updated_at"]
+        fail_count = spotify_cache["fail_count"]
+        next_retry_at = spotify_cache["next_retry_at"]
+        refreshing = spotify_cache["refreshing"]
+        age = now - updated_at if updated_at > 0 else 999999.0
 
-            artists = ", ".join([a.get("name", "") for a in item.get("artists", [])])
-            song = item.get("name", "")
-            album = item.get("album", {}).get("name", "")
-            images = item.get("album", {}).get("images", [])
-            album_art_url = images[0].get("url") if images else None
-            track_id = item.get("id")
-            track_uri = item.get("uri") or (f"spotify:track:{track_id}" if track_id else None)
-            track_url = item.get("external_urls", {}).get("spotify")
+        if age < 5.0 and val is not None:
+            return val
 
-            track_info = {
-                "isPlaying": True,
-                "song": song,
-                "artist": artists,
-                "album": album,
-                "albumArtUrl": album_art_url,
-                "trackId": track_id,
-                "trackUri": track_uri,
-                "trackUrl": track_url,
-                "title": f"{song} — {artists}" if artists else song,
-                "progressMs": data.get("progress_ms", 0),
-                "durationMs": item.get("duration_ms", 0),
-                "playedAtTimestamp": int(time.time()),
-            }
+        if age < 30.0 and val is not None:
+            if not refreshing:
+                spotify_cache["refreshing"] = True
+                refresh_executor.submit(refresh_spotify_worker)
+            return val
 
-            save_last_played(track_info)
-            now_ts = int(time.time())
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now_ts), str(now_ts)))
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-            return track_info
-    except Exception:
-        return {"isPlaying": False, "lastPlayed": last_played}
+        if now < next_retry_at and val is not None:
+            return val
 
-def get_real_os_name():
+        spotify_cache["refreshing"] = True
+
+    new_val = None
     try:
-        with open("/etc/os-release", "r") as f:
-            for line in f:
-                if line.startswith("PRETTY_NAME="):
-                    return line.split("=", 1)[1].strip().strip('"')
-    except Exception:
-        pass
-    return platform.platform()
+        new_val = fetch_spotify_direct()
+    except Exception as e:
+        logger.warning("Sync Spotify fetch warning: %s", e)
 
-def format_compact_uptime(uptime_sec):
-    if uptime_sec <= 0:
-        return "0m"
-    days = int(uptime_sec // 86400)
-    hours = int((uptime_sec % 86400) // 3600)
-    mins = int((uptime_sec % 3600) // 60)
-    years = int(days // 365)
-    rem_days = int(days % 365)
+    now = time.monotonic()
+    with spotify_lock:
+        spotify_cache["refreshing"] = False
+        if new_val is not None:
+            spotify_cache["value"] = new_val
+            spotify_cache["updated_at"] = now
+            spotify_cache["fail_count"] = 0
+            spotify_cache["next_retry_at"] = 0.0
+            return new_val
+        else:
+            spotify_cache["fail_count"] += 1
+            delay = min(5.0 * (2 ** (spotify_cache["fail_count"] - 1)), 60.0)
+            spotify_cache["next_retry_at"] = now + delay
+            if spotify_cache["value"] is not None:
+                return spotify_cache["value"]
+            last_played = get_cached_last_played()
+            return {"isPlaying": False, "lastPlayed": last_played}
 
-    parts = []
-    if years > 0:
-        parts.append(f"{years}y")
-        if rem_days > 0:
-            parts.append(f"{rem_days}d")
-    elif days > 0:
-        parts.append(f"{days}d")
-    if hours > 0:
-        parts.append(f"{hours}h")
-    if mins > 0 or not parts:
-        parts.append(f"{mins}m")
-
-    return " ".join(parts)
-
-def get_system_status():
+# Public System Telemetry DTO
+def get_public_system_status():
     uptime_sec = 0
     try:
         with open("/proc/uptime", "r") as f:
@@ -586,17 +662,18 @@ def get_system_status():
     except Exception:
         pass
 
-    uptime_str = format_compact_uptime(uptime_sec)
-
-    load_avg = 0
+    load_1m = 0.0
+    load_5m = 0.0
+    load_15m = 0.0
     try:
-        load_avg = round(os.getloadavg()[0], 2)
+        loads = os.getloadavg()
+        load_1m = round(loads[0], 2)
+        load_5m = round(loads[1], 2)
+        load_15m = round(loads[2], 2)
     except Exception:
         pass
 
-    mem_total_mb = 0
-    mem_used_mb = 0
-    mem_percent = 0
+    mem_percent = 0.0
     try:
         with open("/proc/meminfo", "r") as f:
             meminfo = {}
@@ -610,111 +687,44 @@ def get_system_status():
                 total_kb = meminfo["MemTotal"]
                 avail_kb = meminfo["MemAvailable"]
                 used_kb = total_kb - avail_kb
-                mem_total_mb = int(total_kb / 1024)
-                mem_used_mb = int(used_kb / 1024)
                 mem_percent = round((used_kb / total_kb) * 100, 1)
     except Exception:
         pass
 
-    mem_used_gb = round(mem_used_mb / 1024, 2)
-    mem_total_gb = round(mem_total_mb / 1024, 2)
-
-    import shutil
-    disk_used_gb = 0
-    disk_total_gb = 0
-    disk_percent = 0
+    disk_percent = 0.0
     try:
+        import shutil
         usage = shutil.disk_usage(SYSTEM_DISK_PATH)
-        disk_total_gb = round(usage.total / (1024**3), 1)
-        disk_used_gb = round(usage.used / (1024**3), 1)
         disk_percent = round((usage.used / usage.total) * 100, 1)
     except Exception:
         pass
 
-    model = platform.machine() or platform.node()
-    if os.path.exists("/proc/device-tree/model"):
-        try:
-            with open("/proc/device-tree/model", "r") as f:
-                raw_model = f.read().strip("\x00").strip()
-                model = raw_model
-        except Exception:
-            pass
-
-    kernel_str = platform.release()
-    try:
-        uname = os.uname()
-        kernel_str = uname.release
-    except Exception:
-        pass
-
-    pkg_count = "N/A"
-    try:
-        import subprocess
-        package_parts = []
-        if shutil.which("dpkg-query"):
-            dpkg_out = subprocess.check_output(
-                ["dpkg-query", "-f", "${binary:Package}\n", "-W"],
-                stderr=subprocess.DEVNULL,
-            ).decode().splitlines()
-            package_parts.append(f"{len(dpkg_out)} (dpkg)")
-        if shutil.which("snap"):
-            snap_out = subprocess.check_output(
-                ["snap", "list"],
-                stderr=subprocess.DEVNULL,
-            ).decode().splitlines()
-            snap_count = max(0, len(snap_out) - 1)
-            package_parts.append(f"{snap_count} (snap)")
-        if package_parts:
-            pkg_count = ", ".join(package_parts)
-    except Exception:
-        pass
-
-    hostname = platform.node()
-    try:
-        hostname = socket.gethostname()
-    except Exception:
-        pass
-
-    cpu_model = platform.processor() or platform.machine()
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.lower().startswith(("model name", "hardware")):
-                    detected_cpu = line.split(":", 1)[1].strip()
-                    if detected_cpu:
-                        cpu_model = detected_cpu
-                        break
-    except Exception:
-        pass
-
-    shell_name = os.path.basename(os.environ.get("SHELL") or os.environ.get("COMSPEC") or "")
-
     return {
-        "status": "online",
-        "uptimeSec": int(uptime_sec),
-        "uptimeStr": uptime_str,
-        "loadAvg": load_avg,
-        "memTotalMb": mem_total_mb,
-        "memUsedMb": mem_used_mb,
-        "memUsedGb": mem_used_gb,
-        "memTotalGb": mem_total_gb,
-        "memPercent": mem_percent,
-        "memStr": f"{mem_used_mb}MiB / {mem_total_mb}MiB ({mem_percent}%)",
-        "diskUsedGb": disk_used_gb,
-        "diskTotalGb": disk_total_gb,
+        "state": "online",
+        "uptimeSeconds": int(uptime_sec),
+        "load": {
+            "1m": load_1m,
+            "5m": load_5m,
+            "15m": load_15m
+        },
+        "memoryPercent": mem_percent,
         "diskPercent": disk_percent,
-        "diskStr": f"{disk_used_gb} GiB / {disk_total_gb} GiB ({disk_percent}%)",
-        "host": model,
-        "kernel": kernel_str,
-        "cpu": cpu_model,
-        "packages": pkg_count,
-        "shell": shell_name,
-        "hostname": hostname,
-        "os": get_real_os_name(),
         "timestamp": int(time.time())
     }
 
+# Last-Seen with Stale Cache (10s)
+last_seen_cache = {
+    "value": None,
+    "updated_at": 0.0
+}
+last_seen_lock = threading.Lock()
+
 def get_last_seen():
+    now_mono = time.monotonic()
+    with last_seen_lock:
+        if last_seen_cache["value"] and (now_mono - last_seen_cache["updated_at"] < 10.0):
+            return last_seen_cache["value"]
+
     now = int(time.time())
     is_discord_online = False
     if DISCORD_USER_ID:
@@ -723,7 +733,7 @@ def get_last_seen():
                 f"{LANYARD_REST_BASE_URL}/{urllib.parse.quote(DISCORD_USER_ID)}",
                 headers={"User-Agent": OUTBOUND_USER_AGENT}
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=EXTERNAL_API_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode())
                 if data.get("success"):
                     d = data.get("data", {})
@@ -741,56 +751,93 @@ def get_last_seen():
             pass
 
     is_online = is_discord_online or is_spotify_online
+    result = {"isOnline": False, "lastSeenTimestamp": now - LAST_SEEN_FALLBACK_SECONDS}
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        if is_online:
-            c.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now), str(now)))
-            conn.commit()
-            conn.close()
-            return {"isOnline": True, "lastSeenTimestamp": now}
-        else:
-            c.execute("SELECT key, val FROM presence_state WHERE key IN ('last_seen_ts', 'last_played_track')")
-            rows = dict(c.fetchall())
-            conn.close()
-            last_ts = int(rows.get('last_seen_ts', 0)) if rows.get('last_seen_ts') else 0
-            if 'last_played_track' in rows:
-                try:
-                    lp = json.loads(rows['last_played_track'])
-                    lp_ts = int(lp.get('playedAtTimestamp', 0))
-                    last_ts = max(last_ts, lp_ts)
-                except Exception:
-                    pass
-            if not last_ts:
-                last_ts = now - LAST_SEEN_FALLBACK_SECONDS
-            return {"isOnline": False, "lastSeenTimestamp": last_ts}
-    except Exception:
-        pass
+        with open_db() as conn:
+            if is_online:
+                conn.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now), str(now)))
+                result = {"isOnline": True, "lastSeenTimestamp": now}
+            else:
+                rows = dict(conn.execute("SELECT key, val FROM presence_state WHERE key IN ('last_seen_ts', 'last_played_track')").fetchall())
+                last_ts = int(rows.get('last_seen_ts', 0)) if rows.get('last_seen_ts') else 0
+                if 'last_played_track' in rows:
+                    try:
+                        lp = json.loads(rows['last_played_track'])
+                        lp_ts = int(lp.get('playedAtTimestamp', 0))
+                        last_ts = max(last_ts, lp_ts)
+                    except Exception:
+                        pass
+                if not last_ts:
+                    last_ts = now - LAST_SEEN_FALLBACK_SECONDS
+                result = {"isOnline": False, "lastSeenTimestamp": last_ts}
+    except Exception as e:
+        logger.warning("Error fetching last seen presence: %s", e)
 
-    return {"isOnline": False, "lastSeenTimestamp": int(time.time() - LAST_SEEN_FALLBACK_SECONDS)}
+    with last_seen_lock:
+        last_seen_cache["value"] = result
+        last_seen_cache["updated_at"] = now_mono
+
+    return result
+
+# Lazy Bounded Rate Limiter
+MAX_RATE_BUCKETS = 10_000
+rate_buckets = {}  # key -> collections.deque
+rate_lock = threading.Lock()
+last_rate_cleanup = 0.0
+
+def cleanup_rate_buckets(now):
+    stale_keys = []
+    for key, bucket in rate_buckets.items():
+        if not bucket or (now - bucket[-1] > 3600):
+            stale_keys.append(key)
+    for key in stale_keys:
+        rate_buckets.pop(key, None)
+
+def allow_action(client_ip, bucket_name, limit, window_seconds):
+    global last_rate_cleanup
+    now = time.monotonic()
+    key = f"{client_ip}:{bucket_name}"
+    with rate_lock:
+        if (now - last_rate_cleanup > 300) or (len(rate_buckets) > MAX_RATE_BUCKETS):
+            cleanup_rate_buckets(now)
+            last_rate_cleanup = now
+
+        bucket = rate_buckets.get(key)
+        if bucket is None:
+            bucket = collections.deque()
+            rate_buckets[key] = bucket
+
+        cutoff = now - window_seconds
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+
+        if len(bucket) >= limit:
+            return False
+
+        bucket.append(now)
+        return True
 
 def get_guestbook_messages(client_ip):
     ip_hash = hash_identifier(client_ip, "guestbook")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with open_db() as conn:
+        rows = conn.execute("""
+            SELECT id, name, text, created_at, ip_hash
+            FROM guestbook
+            ORDER BY created_at DESC
+            LIMIT 50
+        """).fetchall()
 
-    c.execute("""
-        SELECT id, name, text, created_at, ip_hash
-        FROM guestbook
-        ORDER BY created_at DESC
-        LIMIT 50
-    """)
-    rows = c.fetchall()
+        all_reactions = conn.execute("SELECT message_id, emoji, ip_hash FROM guestbook_reactions").fetchall()
 
-    c.execute("SELECT message_id, emoji, ip_hash FROM guestbook_reactions")
-    all_reactions = c.fetchall()
-
-    has_posted = any(r[4] == ip_hash for r in rows)
+    has_posted = any(r["ip_hash"] == ip_hash for r in rows)
 
     reactions_map = {}
-    for mid, emoji, r_ip_hash in all_reactions:
+    for r in all_reactions:
+        mid = r["message_id"]
+        emoji = r["emoji"]
+        r_ip_hash = r["ip_hash"]
         if mid not in reactions_map:
             reactions_map[mid] = {}
         if emoji not in reactions_map[mid]:
@@ -801,7 +848,7 @@ def get_guestbook_messages(client_ip):
 
     messages = []
     for r in rows:
-        mid = r[0]
+        mid = r["id"]
         msg_reactions = reactions_map.get(mid, {})
         formatted_reactions = {}
         for em in ALLOWED_EMOJIS:
@@ -813,25 +860,22 @@ def get_guestbook_messages(client_ip):
 
         messages.append({
             "id": mid,
-            "name": r[1],
-            "text": r[2],
-            "createdAt": r[3],
-            "isOwner": (r[4] == ip_hash),
+            "name": r["name"],
+            "text": r["text"],
+            "createdAt": r["created_at"],
+            "isOwner": (r["ip_hash"] == ip_hash),
             "reactions": formatted_reactions
         })
 
-    conn.close()
     return messages, has_posted
 
 def add_guestbook_message(client_ip, name, text):
     name = (name or "").strip()
     text = (text or "").strip()
 
-    # Filter control characters
     name = "".join(ch for ch in name if ord(ch) >= 32 and ch not in ["\u200b", "\u200c", "\u200d", "\ufeff"]).strip()
     name = re.sub(r"\s+", " ", name)
 
-    # Blacklist domains in nickname
     if re.search(r"(https?:\/\/|www\.|t\.me|discord|\.com|\.ru|\.xyz|\.net|\.org)", name, re.I):
         return False, "Имя не должно содержать ссылок или доменов."
 
@@ -849,32 +893,25 @@ def add_guestbook_message(client_ip, name, text):
     if len(text) > GUESTBOOK_MAX_MESSAGE_LENGTH:
         return False, f"Сообщение не должно превышать {GUESTBOOK_MAX_MESSAGE_LENGTH} символов."
 
-    name = html.escape(name)
-    text = html.escape(text)
-
     ip_hash = hash_identifier(client_ip, "guestbook")
     now = int(time.time())
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
     try:
-        c.execute("SELECT 1 FROM guestbook WHERE ip_hash = ?", (ip_hash,))
-        if c.fetchone():
-            return False, "Вы уже оставили сообщение на Стене."
+        with open_db() as conn:
+            existing = conn.execute("SELECT 1 FROM guestbook WHERE ip_hash = ?", (ip_hash,)).fetchone()
+            if existing:
+                return False, "Вы уже оставили сообщение на Стене."
 
-        c.execute("""
-            INSERT INTO guestbook (ip_hash, name, text, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (ip_hash, name, text, now, now))
-        conn.commit()
-        return True, "Сообщение успешно опубликовано!"
+            conn.execute("""
+                INSERT INTO guestbook (ip_hash, name, text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (ip_hash, name, text, now, now))
+            return True, "Сообщение успешно опубликовано!"
     except sqlite3.IntegrityError:
         return False, "Вы уже оставили сообщение на Стене."
     except Exception as e:
-        return False, f"Ошибка базы данных: {e}"
-    finally:
-        conn.close()
+        logger.exception("Database error while adding guestbook message: %s", e)
+        return False, "Ошибка базы данных"
 
 def toggle_reaction(client_ip, message_id, emoji):
     if emoji not in ALLOWED_EMOJIS:
@@ -887,28 +924,23 @@ def toggle_reaction(client_ip, message_id, emoji):
 
     ip_hash = hash_identifier(client_ip, "guestbook")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     try:
-        c.execute("SELECT 1 FROM guestbook WHERE id = ?", (mid,))
-        if not c.fetchone():
-            return False, "Сообщение не найдено"
+        with open_db() as conn:
+            msg = conn.execute("SELECT 1 FROM guestbook WHERE id = ?", (mid,)).fetchone()
+            if not msg:
+                return False, "Сообщение не найдено"
 
-        c.execute("SELECT 1 FROM guestbook_reactions WHERE message_id = ? AND ip_hash = ? AND emoji = ?", (mid, ip_hash, emoji))
-        if c.fetchone():
-            c.execute("DELETE FROM guestbook_reactions WHERE message_id = ? AND ip_hash = ? AND emoji = ?", (mid, ip_hash, emoji))
-            conn.commit()
-            return True, "Реакция снята"
-        else:
-            c.execute("INSERT INTO guestbook_reactions (message_id, ip_hash, emoji) VALUES (?, ?, ?)", (mid, ip_hash, emoji))
-            conn.commit()
-            return True, "Реакция добавлена"
+            existing_reaction = conn.execute("SELECT 1 FROM guestbook_reactions WHERE message_id = ? AND ip_hash = ? AND emoji = ?", (mid, ip_hash, emoji)).fetchone()
+            if existing_reaction:
+                conn.execute("DELETE FROM guestbook_reactions WHERE message_id = ? AND ip_hash = ? AND emoji = ?", (mid, ip_hash, emoji))
+                return True, "Реакция снята"
+            else:
+                conn.execute("INSERT INTO guestbook_reactions (message_id, ip_hash, emoji) VALUES (?, ?, ?)", (mid, ip_hash, emoji))
+                return True, "Реакция добавлена"
     except Exception as e:
-        return False, str(e)
-    finally:
-        conn.close()
+        logger.exception("Database error while toggling reaction: %s", e)
+        return False, "Ошибка базы данных"
 
-# GitHub & Profile Dynamic Config
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_API_BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/")
@@ -918,6 +950,110 @@ github_cache = {
     "timestamp": 0,
     "projects": []
 }
+
+def filter_public_projects(repos):
+    return [
+        r for r in repos
+        if not r.get("isPrivate") and not r.get("private")
+    ]
+
+def fetch_repo_languages(lang_url, headers):
+    if not lang_url or not GITHUB_TOKEN:
+        return []
+    try:
+        lreq = urllib.request.Request(lang_url, headers=headers)
+        with urllib.request.urlopen(lreq, timeout=3) as lresp:
+            lang_data = json.loads(lresp.read().decode("utf-8"))
+            return list(lang_data.keys())[:4]
+    except Exception:
+        return []
+
+def get_github_projects(force_refresh=False, hide_private=True):
+    global github_cache
+    now = time.time()
+
+    with github_cache_lock:
+        if not force_refresh and github_cache["projects"] and (now - github_cache["timestamp"] < GITHUB_CACHE_TTL_SECONDS):
+            cached = github_cache["projects"]
+            return filter_public_projects(cached) if hide_private else cached
+
+    headers = {
+        "User-Agent": os.environ.get("GITHUB_USER_AGENT", "ProfileCard"),
+        "Accept": "application/vnd.github.v3+json"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        url = f"{GITHUB_API_BASE_URL}/user/repos?affiliation=owner&sort=updated&per_page=100"
+    elif GITHUB_USERNAME:
+        url = f"{GITHUB_API_BASE_URL}/users/{urllib.parse.quote(GITHUB_USERNAME)}/repos?sort=updated&per_page=100"
+    else:
+        url = None
+
+    try:
+        if not url:
+            raise RuntimeError("GitHub integration is not configured")
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=EXTERNAL_API_TIMEOUT * 2) as resp:
+            raw_repos = json.loads(resp.read().decode("utf-8"))
+
+            lang_urls = [r.get("languages_url") for r in raw_repos]
+            all_langs = []
+            if GITHUB_TOKEN:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    all_langs = list(executor.map(lambda u: fetch_repo_languages(u, headers), lang_urls))
+            else:
+                all_langs = [[] for _ in raw_repos]
+
+            projects = []
+            for idx, r in enumerate(raw_repos):
+                name = r.get("name", "")
+                is_private = bool(r.get("private", False))
+                if is_private:
+                    continue  # Strict default-deny for private repos
+
+                desc = r.get("description") or name
+                topics = r.get("topics", [])
+                stars = r.get("stargazers_count", 0)
+                homepage = r.get("homepage")
+                html_url = r.get("html_url")
+
+                tags = all_langs[idx] if idx < len(all_langs) else []
+                if not tags and r.get("language"):
+                    tags.append(r.get("language"))
+
+                for t in topics[:3]:
+                    if t.lower() not in [x.lower() for x in tags] and len(tags) < 5:
+                        tags.append(t)
+
+                status_badge = f"⭐ {stars}" if stars > 0 else "Активный"
+                status_type = "stars" if stars > 0 else "active"
+
+                projects.append({
+                    "id": r.get("id", name),
+                    "title": name,
+                    "description": desc,
+                    "tags": tags if tags else ["Open Source"],
+                    "stars": stars,
+                    "statusBadge": status_badge,
+                    "statusType": status_type,
+                    "isPrivate": False,
+                    "link": html_url,
+                    "demo": homepage,
+                    "updatedAt": r.get("updated_at")
+                })
+
+            if projects:
+                with github_cache_lock:
+                    github_cache["timestamp"] = now
+                    github_cache["projects"] = projects
+                return filter_public_projects(projects)
+    except Exception as e:
+        logger.warning("GitHub API fetch notice: %s", e)
+
+    with github_cache_lock:
+        if not github_cache["projects"]:
+            github_cache["projects"] = CONFIGURED_PROJECTS
+        return filter_public_projects(github_cache["projects"])
 
 def get_profile_config(req_lang=None):
     default_lang = os.environ.get("PROFILE_LANG", "ru").lower().strip()
@@ -1043,131 +1179,33 @@ def load_configured_projects():
             return []
         return parsed if isinstance(parsed, list) else []
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"Projects configuration notice: {exc}")
+        logger.warning("Projects configuration notice: %s", exc)
         return []
 
 CONFIGURED_PROJECTS = load_configured_projects()
 
-from concurrent.futures import ThreadPoolExecutor
-
-def fetch_repo_languages(lang_url, headers):
-    if not lang_url or not GITHUB_TOKEN:
-        return []
-    try:
-        lreq = urllib.request.Request(lang_url, headers=headers)
-        with urllib.request.urlopen(lreq, timeout=3) as lresp:
-            lang_data = json.loads(lresp.read().decode("utf-8"))
-            return list(lang_data.keys())[:4]
-    except Exception:
-        return []
-
-def get_github_projects(force_refresh=False, hide_private=None):
-    global github_cache
-    now = time.time()
-
-    should_hide_private = (
-        env_bool("GITHUB_HIDE_PRIVATE", False)
-        or env_bool("HIDE_PRIVATE_PROJECTS", False)
-        or env_bool("HIDE_PRIVATE_REPOS", False)
-        if hide_private is None
-        else hide_private
-    )
-
-    with github_cache_lock:
-        if not force_refresh and github_cache["projects"] and (now - github_cache["timestamp"] < GITHUB_CACHE_TTL_SECONDS):
-            cached = github_cache["projects"]
-            return [p for p in cached if not p.get("isPrivate")] if should_hide_private else cached
-
-    headers = {
-        "User-Agent": os.environ.get("GITHUB_USER_AGENT", "ProfileCard"),
-        "Accept": "application/vnd.github.v3+json"
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-        url = f"{GITHUB_API_BASE_URL}/user/repos?affiliation=owner&sort=updated&per_page=100"
-    elif GITHUB_USERNAME:
-        url = f"{GITHUB_API_BASE_URL}/users/{urllib.parse.quote(GITHUB_USERNAME)}/repos?sort=updated&per_page=100"
-    else:
-        url = None
-
-    try:
-        if not url:
-            raise RuntimeError("GitHub integration is not configured")
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            raw_repos = json.loads(resp.read().decode("utf-8"))
-
-            # Fetch languages in parallel across repos (super fast)
-            lang_urls = [r.get("languages_url") for r in raw_repos]
-            all_langs = []
-            if GITHUB_TOKEN:
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    all_langs = list(executor.map(lambda u: fetch_repo_languages(u, headers), lang_urls))
-            else:
-                all_langs = [[] for _ in raw_repos]
-
-            projects = []
-            for idx, r in enumerate(raw_repos):
-                name = r.get("name", "")
-                is_private = bool(r.get("private", False))
-                desc = r.get("description") or name
-                topics = r.get("topics", [])
-                stars = r.get("stargazers_count", 0)
-                homepage = r.get("homepage")
-                html_url = r.get("html_url")
-
-                tags = all_langs[idx] if idx < len(all_langs) else []
-                if not tags and r.get("language"):
-                    tags.append(r.get("language"))
-
-                for t in topics[:3]:
-                    if t.lower() not in [x.lower() for x in tags] and len(tags) < 5:
-                        tags.append(t)
-
-                status_badge = "Закрытый проект" if is_private else (f"⭐ {stars}" if stars > 0 else "Активный")
-                status_type = "private" if is_private else ("stars" if stars > 0 else "active")
-
-                # CRITICAL SECURITY RULE: If private, link is strictly None!
-                link_url = None if is_private else html_url
-
-                projects.append({
-                    "id": r.get("id", name),
-                    "title": name,
-                    "description": desc,
-                    "tags": tags if tags else ["Open Source"],
-                    "stars": stars,
-                    "statusBadge": status_badge,
-                    "statusType": status_type,
-                    "isPrivate": is_private,
-                    "link": link_url,
-                    "demo": homepage if homepage and not is_private else None,
-                    "updatedAt": r.get("updated_at")
-                })
-
-            if projects:
-                with github_cache_lock:
-                    github_cache["timestamp"] = now
-                    github_cache["projects"] = projects
-                return [p for p in projects if not p.get("isPrivate")] if should_hide_private else projects
-    except Exception as e:
-        print(f"GitHub API fetch notice (rate limit or offline): {e}")
-
-    # Fallback to cache or explicitly configured projects
-    with github_cache_lock:
-        if not github_cache["projects"]:
-            github_cache["projects"] = CONFIGURED_PROJECTS
-        cached = github_cache["projects"]
-        return [p for p in cached if not p.get("isPrivate")] if should_hide_private else cached
-
-class UnifiedHandler(http.server.SimpleHTTPRequestHandler):
+class UnifiedHandler(http.server.BaseHTTPRequestHandler):
     def get_client_ip(self):
-        xff = self.headers.get("X-Forwarded-For")
-        if xff:
-            return xff.split(",")[0].strip()
+        # Trusted Caddy sets X-Real-IP
         x_real_ip = self.headers.get("X-Real-IP")
         if x_real_ip:
             return x_real_ip.strip()
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
         return self.client_address[0]
+
+    def send_cors_headers(self):
+        request_origin = self.headers.get("Origin", "")
+        if request_origin:
+            if CORS_ALLOWED_ORIGINS and request_origin in CORS_ALLOWED_ORIGINS:
+                self.send_header("Access-Control-Allow-Origin", request_origin)
+                self.send_header("Vary", "Origin")
+            elif not CORS_ALLOWED_ORIGINS:
+                # Default allow all in development if no explicit origins set
+                self.send_header("Access-Control-Allow-Origin", request_origin)
+                self.send_header("Vary", "Origin")
+            # If explicit origins defined and request_origin not in it -> default deny (no header sent)
 
     def send_json_response(self, code, payload):
         try:
@@ -1184,20 +1222,45 @@ class UnifiedHandler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def send_cors_headers(self):
-        request_origin = self.headers.get("Origin", "")
-        if request_origin:
-            if not CORS_ALLOWED_ORIGINS or request_origin in CORS_ALLOWED_ORIGINS:
-                self.send_header("Access-Control-Allow-Origin", request_origin)
-                self.send_header("Vary", "Origin")
-        else:
-            self.send_header("Access-Control-Allow-Origin", "*")
+    def send_empty_response(self, code):
+        try:
+            self.send_response(code)
+            self.send_cors_headers()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def read_json_body(self):
+        content_length_header = self.headers.get("Content-Length")
+        if not content_length_header:
+            self.send_json_response(411, {"error": "length_required"})
+            return None
+        try:
+            content_length = int(content_length_header)
+        except ValueError:
+            self.send_json_response(400, {"error": "invalid_content_length"})
+            return None
+
+        if content_length <= 0 or content_length > MAX_JSON_BODY_BYTES:
+            self.send_json_response(413, {"error": "payload_too_large"})
+            return None
+
+        raw = self.rfile.read(content_length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json_response(400, {"error": "invalid_json"})
+            return None
 
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_HEAD(self):
@@ -1211,7 +1274,21 @@ class UnifiedHandler(http.server.SimpleHTTPRequestHandler):
         client_ip = self.get_client_ip()
         user_agent = self.headers.get("User-Agent", "")
 
-        record_unique_visit(client_ip, user_agent)
+        # Internal Health checks
+        if path == "/health/live":
+            self.send_json_response(200, {"status": "ok"})
+            return
+        elif path == "/health/ready":
+            try:
+                with open_db() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                self.send_json_response(200, {"status": "ready"})
+            except Exception as e:
+                logger.exception("Readiness probe failed: %s", e)
+                self.send_json_response(503, {"status": "degraded", "error": "db_unavailable"})
+            return
+
+        # Active visitors heartbeat update
         if path == "/api/live-visitors" or visitor_id:
             active_count = record_visitor_heartbeat(client_ip, visitor_id)
         else:
@@ -1219,118 +1296,112 @@ class UnifiedHandler(http.server.SimpleHTTPRequestHandler):
                 cutoff = time.time() - ACTIVE_VISITOR_TTL_SECONDS
                 active_count = len([k for k, ts in ACTIVE_VISITORS.items() if ts >= cutoff])
 
+        # Deterministic flat dispatch table with immediate returns
         if path in ["", "/api/spotify-status", "/api/spotify", "/api/spotify/playing", "/api/spotify/current"]:
-            result = get_spotify_status()
-            self.send_json_response(200, result)
-        elif path == "/api/system-status":
-            result = get_system_status()
-            self.send_json_response(200, result)
-        url_lang = query_params.get("lang", [None])[0]
+            return self.send_json_response(200, get_spotify_status())
+        if path == "/api/system-status":
+            return self.send_json_response(200, get_public_system_status())
         if path == "/api/profile":
-            self.send_json_response(200, get_profile_config(req_lang=url_lang))
-        elif path in ["/api/projects", "/api/github-projects"]:
-            force_refresh = "refresh" in query_params or "force" in query_params
-            hide_param = query_params.get("hide_private", [None])[0]
-            hide_priv = (hide_param.lower() in ("true", "1", "yes")) if hide_param is not None else None
-            self.send_json_response(200, {"projects": get_github_projects(force_refresh=force_refresh, hide_private=hide_priv)})
-        elif path == "/api/last-seen":
-            result = get_last_seen()
-            self.send_json_response(200, result)
-        elif path == "/api/live-visitors":
-            self.send_json_response(200, {"onlineVisitors": active_count})
-        elif path == "/api/visits-history":
-            stats = get_visits_stats()
-            self.send_json_response(200, stats)
-        elif path == "/api/my-session":
-            sess = get_my_session(client_ip, user_agent)
-            self.send_json_response(200, sess)
-        elif path == "/api/guestbook":
+            url_lang = query_params.get("lang", [None])[0]
+            return self.send_json_response(200, get_profile_config(req_lang=url_lang))
+        if path in ["/api/projects", "/api/github-projects"]:
+            return self.send_json_response(200, {"projects": get_github_projects(force_refresh=False, hide_private=True)})
+        if path == "/api/last-seen":
+            return self.send_json_response(200, get_last_seen())
+        if path == "/api/live-visitors":
+            return self.send_json_response(200, {"onlineVisitors": active_count})
+        if path == "/api/visits-history":
+            return self.send_json_response(200, get_visits_stats())
+        if path == "/api/my-session":
+            return self.send_json_response(200, get_my_session(client_ip, user_agent))
+        if path == "/api/guestbook":
             messages, has_posted = get_guestbook_messages(client_ip)
-            self.send_json_response(200, {
+            return self.send_json_response(200, {
                 "messages": messages,
                 "count": len(messages),
                 "hasPosted": has_posted,
                 "onlineVisitors": active_count
             })
-        else:
-            self.send_json_response(404, {"error": "not_found"})
+        return self.send_json_response(404, {"error": "not_found"})
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
-        query_params = urllib.parse.parse_qs(parsed.query)
-        visitor_id = query_params.get("vid", [None])[0]
         client_ip = self.get_client_ip()
         user_agent = self.headers.get("User-Agent", "")
-        record_unique_visit(client_ip, user_agent)
-        record_visitor_heartbeat(client_ip, visitor_id)
 
-        if path == "/api/guestbook":
-            try:
-                content_len = int(self.headers.get("Content-Length", 0))
-                if content_len > MAX_REQUEST_BYTES:
-                    self.send_json_response(413, {"success": False, "error": "payload_too_large"})
-                    return
+        if path == "/api/visit":
+            record_unique_visit(client_ip, user_agent)
+            self.send_empty_response(204)
+            return
 
-                raw_body = self.rfile.read(content_len).decode("utf-8")
-                data = json.loads(raw_body)
+        elif path == "/api/guestbook":
+            if not allow_action(client_ip, "guestbook_post", limit=3, window_seconds=300):
+                self.send_json_response(429, {"success": False, "error": "Слишком много сообщений. Пожалуйста, подождите."})
+                return
 
-                name = data.get("name", "")
-                text = data.get("text", "")
+            data = self.read_json_body()
+            if data is None:
+                return
 
-                success, msg = add_guestbook_message(client_ip, name, text)
-                messages, has_posted = get_guestbook_messages(client_ip)
-                if success:
-                    self.send_json_response(200, {
-                        "success": True,
-                        "message": msg,
-                        "messages": messages,
-                        "hasPosted": True
-                    })
-                else:
-                    self.send_json_response(400, {
-                        "success": False,
-                        "error": msg,
-                        "hasPosted": has_posted
-                    })
-            except Exception as e:
-                self.send_json_response(500, {"success": False, "error": str(e)})
+            name = data.get("name", "")
+            text = data.get("text", "")
+
+            success, msg = add_guestbook_message(client_ip, name, text)
+            messages, has_posted = get_guestbook_messages(client_ip)
+            if success:
+                self.send_json_response(200, {
+                    "success": True,
+                    "message": msg,
+                    "messages": messages,
+                    "hasPosted": True
+                })
+            else:
+                self.send_json_response(400, {
+                    "success": False,
+                    "error": msg,
+                    "hasPosted": has_posted
+                })
 
         elif path == "/api/guestbook/react":
-            try:
-                content_len = int(self.headers.get("Content-Length", 0))
-                raw_body = self.rfile.read(content_len).decode("utf-8")
-                data = json.loads(raw_body)
+            if not allow_action(client_ip, "guestbook_react", limit=30, window_seconds=60):
+                self.send_json_response(429, {"success": False, "error": "Слишком много реакций. Пожалуйста, подождите."})
+                return
 
-                message_id = data.get("messageId")
-                emoji = data.get("emoji")
+            data = self.read_json_body()
+            if data is None:
+                return
 
-                success, msg = toggle_reaction(client_ip, message_id, emoji)
-                messages, has_posted = get_guestbook_messages(client_ip)
+            message_id = data.get("messageId")
+            emoji = data.get("emoji")
 
-                if success:
-                    self.send_json_response(200, {
-                        "success": True,
-                        "message": msg,
-                        "messages": messages,
-                        "hasPosted": has_posted
-                    })
-                else:
-                    self.send_json_response(400, {"success": False, "error": msg})
-            except Exception as e:
-                self.send_json_response(500, {"success": False, "error": str(e)})
+            success, msg = toggle_reaction(client_ip, message_id, emoji)
+            messages, has_posted = get_guestbook_messages(client_ip)
+
+            if success:
+                self.send_json_response(200, {
+                    "success": True,
+                    "message": msg,
+                    "messages": messages,
+                    "hasPosted": has_posted
+                })
+            else:
+                self.send_json_response(400, {"success": False, "error": msg})
 
         else:
             self.send_json_response(404, {"error": "not_found"})
 
     def log_message(self, format, *args):
+        # Override to suppress default noisy console stdout
         pass
 
-class ReusableThreadingServer(socketserver.ThreadingTCPServer):
+class NexusHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
 if __name__ == "__main__":
     get_ip_hash_secret()
-    server = ReusableThreadingServer((BIND_HOST, PORT), UnifiedHandler)
-    print(f"Profile backend listening on {BIND_HOST}:{PORT}")
+    server = NexusHTTPServer((BIND_HOST, PORT), UnifiedHandler)
+    logger.info(f"Whoami Identity Backend listening on {BIND_HOST}:{PORT}")
     server.serve_forever()

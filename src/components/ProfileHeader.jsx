@@ -42,33 +42,22 @@ export const ProfileHeader = ({ personal, presence, weather, showToast, onOpenTe
     setImgError(false);
   }, [presence.spotify?.song, presence.lastPlayedSpotify?.song]);
 
-  // 60 FPS Ultra-Smooth live Spotify progress bar ticker (requestAnimationFrame)
+  // 10 FPS (100ms) Spotify progress interpolation with CSS transition smoothing
   useEffect(() => {
     if (!presence.spotify?.progressMs) {
       setSpotifyCurrentMs(0);
       return;
     }
-
     const startProgress = presence.spotify.progressMs;
-    const startTime = performance.now();
+    const startedAt = performance.now();
     const duration = presence.spotify.durationMs || 0;
-
-    setSpotifyCurrentMs(startProgress);
-
-    let animationFrameId;
-    const tick = () => {
-      const elapsed = performance.now() - startTime;
-      const current = Math.min(startProgress + elapsed, duration);
-      setSpotifyCurrentMs(current);
-
-      if (current < duration) {
-        animationFrameId = requestAnimationFrame(tick);
-      }
+    const update = () => {
+      const elapsed = performance.now() - startedAt;
+      setSpotifyCurrentMs(Math.min(startProgress + elapsed, duration));
     };
-
-    animationFrameId = requestAnimationFrame(tick);
-
-    return () => cancelAnimationFrame(animationFrameId);
+    update();
+    const timer = setInterval(update, 100);
+    return () => clearInterval(timer);
   }, [presence.spotify?.progressMs, presence.spotify?.durationMs, presence.spotify?.song]);
 
   const spotifyProgressPercent =

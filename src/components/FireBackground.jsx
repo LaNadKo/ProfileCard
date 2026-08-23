@@ -1,94 +1,148 @@
 import React, { useEffect, useRef } from 'react';
 
+// Pre-render radial gradient glow sprite to an offscreen canvas
+function createGlowSprite() {
+  const sprite = document.createElement('canvas');
+  const size = 32;
+  sprite.width = size;
+  sprite.height = size;
+  const sCtx = sprite.getContext('2d');
+  if (!sCtx) return sprite;
+
+  const center = size / 2;
+  const grad = sCtx.createRadialGradient(center, center, 0, center, center, center);
+  grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+  grad.addColorStop(0.2, 'rgba(255, 255, 255, 0.8)');
+  grad.addColorStop(0.6, 'rgba(220, 220, 230, 0.3)');
+  grad.addColorStop(1, 'rgba(200, 200, 210, 0)');
+
+  sCtx.fillStyle = grad;
+  sCtx.beginPath();
+  sCtx.arc(center, center, center, 0, Math.PI * 2);
+  sCtx.fill();
+
+  return sprite;
+}
+
 export const FireBackground = () => {
   const canvasRef = useRef(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) return undefined;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) return undefined;
 
-    let animationFrameId;
-    let width = (canvas.width = window.innerWidth);
-    let height = (canvas.height = window.innerHeight);
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const glowSprite = createGlowSprite();
 
-    const handleResize = () => {
-      width = canvas.width = window.innerWidth;
-      height = canvas.height = window.innerHeight;
+    let animationFrameId = null;
+    let width = window.innerWidth;
+    let height = window.innerHeight;
+    let dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+
+    const resize = () => {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
     };
 
-    window.addEventListener('resize', handleResize);
+    resize();
+    window.addEventListener('resize', resize);
 
-    // Monochrome ash sparks & rising glowing embers
-    const embersCount = Math.min(Math.floor(width / 15), 75);
+    // Particle density: reduced on mobile (<768px)
+    const isMobile = width < 768;
+    const baseDensity = Math.min(Math.floor(width / 18), 60);
+    const embersCount = isMobile ? Math.floor(baseDensity * 0.5) : baseDensity;
     const embers = [];
-
-    const emberColors = [
-      'rgba(255, 255, 255, ',  // pure white spark
-      'rgba(225, 225, 230, ',  // silver spark
-      'rgba(180, 180, 190, ',  // ash light gray
-      'rgba(130, 130, 140, ',  // muted gray
-      'rgba(90, 90, 100, ',    // deep charcoal particle
-    ];
 
     for (let i = 0; i < embersCount; i++) {
       embers.push({
         x: Math.random() * width,
         y: Math.random() * height,
-        size: Math.random() * 2.4 + 0.8,
-        speedY: Math.random() * 1.1 + 0.4,
-        speedX: (Math.random() - 0.5) * 0.5,
-        colorBase: emberColors[Math.floor(Math.random() * emberColors.length)],
-        opacity: Math.random() * 0.7 + 0.15,
-        opacitySpeed: (Math.random() * 0.015 + 0.005) * (Math.random() > 0.5 ? 1 : -1),
+        size: Math.random() * 2.2 + 0.8,
+        speedY: Math.random() * 1.0 + 0.3,
+        speedX: (Math.random() - 0.5) * 0.4,
+        opacity: Math.random() * 0.6 + 0.2,
+        opacitySpeed: (Math.random() * 0.01 + 0.003) * (Math.random() > 0.5 ? 1 : -1),
         wobble: Math.random() * Math.PI * 2,
         wobbleSpeed: Math.random() * 0.02 + 0.01,
       });
     }
 
-    const render = () => {
+    const drawFrame = () => {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
       for (let i = 0; i < embers.length; i++) {
         const e = embers[i];
-        e.y -= e.speedY;
-        e.wobble += e.wobbleSpeed;
-        e.x += e.speedX + Math.sin(e.wobble) * 0.4;
+        if (!prefersReducedMotion) {
+          e.y -= e.speedY;
+          e.wobble += e.wobbleSpeed;
+          e.x += e.speedX + Math.sin(e.wobble) * 0.35;
 
-        e.opacity += e.opacitySpeed;
-        if (e.opacity > 0.85) {
-          e.opacity = 0.85;
-          e.opacitySpeed = -Math.abs(e.opacitySpeed);
-        } else if (e.opacity < 0.1) {
-          e.opacity = 0.1;
-          e.opacitySpeed = Math.abs(e.opacitySpeed);
+          e.opacity += e.opacitySpeed;
+          if (e.opacity > 0.8) {
+            e.opacity = 0.8;
+            e.opacitySpeed = -Math.abs(e.opacitySpeed);
+          } else if (e.opacity < 0.15) {
+            e.opacity = 0.15;
+            e.opacitySpeed = Math.abs(e.opacitySpeed);
+          }
+
+          if (e.y < -20 || e.x < -20 || e.x > width + 20) {
+            e.y = height + Math.random() * 20;
+            e.x = Math.random() * width;
+            e.opacity = Math.random() * 0.4 + 0.2;
+          }
         }
 
-        if (e.y < -20 || e.x < -20 || e.x > width + 20) {
-          e.y = height + Math.random() * 20;
-          e.x = Math.random() * width;
-          e.opacity = Math.random() * 0.5 + 0.2;
-        }
-
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
-        ctx.fillStyle = `${e.colorBase}${e.opacity})`;
-        ctx.shadowColor = `${e.colorBase}0.8)`;
-        ctx.shadowBlur = e.size * 5;
-        ctx.fill();
-        ctx.restore();
+        ctx.globalAlpha = e.opacity;
+        const drawSize = e.size * 6;
+        ctx.drawImage(glowSprite, e.x - drawSize / 2, e.y - drawSize / 2, drawSize, drawSize);
       }
-
-      animationFrameId = requestAnimationFrame(render);
+      ctx.globalAlpha = 1.0;
     };
 
-    render();
+    if (prefersReducedMotion) {
+      drawFrame();
+      return () => {
+        window.removeEventListener('resize', resize);
+      };
+    }
+
+    let isRunning = true;
+    const loop = () => {
+      if (!isRunning) return;
+      drawFrame();
+      animationFrameId = requestAnimationFrame(loop);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        if (animationFrameId) {
+          cancelAnimationFrame(animationFrameId);
+          animationFrameId = null;
+        }
+      } else if (!animationFrameId && isRunning) {
+        animationFrameId = requestAnimationFrame(loop);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    animationFrameId = requestAnimationFrame(loop);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      cancelAnimationFrame(animationFrameId);
+      isRunning = false;
+      window.removeEventListener('resize', resize);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
     };
   }, []);
 

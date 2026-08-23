@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import { apiUrl, appConfig, storageKey } from '../config/appConfig';
+import { useSmartPolling } from './useSmartPolling';
 
 // Generates or retrieves a persistent unique Device Visitor ID
 function getVisitorId() {
@@ -25,44 +26,29 @@ export function useLiveVisitors() {
     loaded: false,
   });
 
-  useEffect(() => {
-    let isMounted = true;
+  const pollVisitors = useCallback(async ({ signal }) => {
     const vid = getVisitorId();
-
-    const fetchVisitors = async () => {
-      try {
-        const res = await fetch(apiUrl('live-visitors', { vid, _t: Date.now() }));
-        if (!res.ok) return;
-        const data = await res.json();
-        if (isMounted && data && typeof data.onlineVisitors === 'number') {
-          setVisitors({
-            count: data.onlineVisitors,
-            loaded: true,
-          });
-        }
-      } catch {
-        if (isMounted) {
-          setVisitors((prev) => ({ ...prev, loaded: true }));
-        }
+    try {
+      const res = await fetch(apiUrl('live-visitors', { vid, _t: Date.now() }), { signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && typeof data.onlineVisitors === 'number') {
+        setVisitors({
+          count: data.onlineVisitors,
+          loaded: true,
+        });
       }
-    };
-
-    fetchVisitors();
-    const interval = setInterval(fetchVisitors, appConfig.polling.liveVisitorsMs);
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        fetchVisitors();
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setVisitors((prev) => ({ ...prev, loaded: true }));
       }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-      document.removeEventListener('visibilitychange', handleVisibility);
-    };
+    }
   }, []);
+
+  useSmartPolling(pollVisitors, {
+    interval: appConfig.polling.liveVisitorsMs || 5000,
+    maxBackoff: 30000,
+  });
 
   return visitors;
 }

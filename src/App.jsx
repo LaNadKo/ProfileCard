@@ -10,6 +10,7 @@ import { TerminalModal } from './components/TerminalModal';
 import { Toast } from './components/Toast';
 import { usePresence } from './hooks/usePresence';
 import { useWeather } from './hooks/useWeather';
+import { useVisitTracking } from './hooks/useVisitTracking';
 import { getLanguage } from './i18n/translations';
 import './styles/global.css';
 import './styles/card.css';
@@ -21,6 +22,9 @@ export function App() {
   const [toastMessage, setToastMessage] = useState('');
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
   const [guestbookCount, setGuestbookCount] = useState(0);
+
+  // Throttled isolated visit tracking
+  useVisitTracking();
 
   // Global shared presence and weather
   const presence = usePresence({
@@ -93,6 +97,7 @@ export function App() {
                 onCountChange={setGuestbookCount}
                 config={config.guestbook}
                 lang={lang}
+                isActive={activeTab === 'guestbook'}
               />
             </div>
           </div>
