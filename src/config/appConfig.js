@@ -27,7 +27,7 @@ export const appConfig = {
   polling: {
     profileMs: positiveInt(env.VITE_PROFILE_REFRESH_MS, 300_000),
     serverStatusMs: positiveInt(env.VITE_SERVER_STATUS_REFRESH_MS, 15_000),
-    spotifyMs: positiveInt(env.VITE_SPOTIFY_REFRESH_MS, 2_500),
+    spotifyMs: positiveInt(env.VITE_SPOTIFY_REFRESH_MS, 1_500),
     lastSeenMs: positiveInt(env.VITE_LAST_SEEN_REFRESH_MS, 30_000),
     weatherMs: positiveInt(env.VITE_WEATHER_REFRESH_MS, 600_000),
     liveVisitorsMs: positiveInt(env.VITE_LIVE_VISITORS_REFRESH_MS, 2_500),

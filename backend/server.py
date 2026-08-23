@@ -612,29 +612,29 @@ def get_spotify_status():
         updated_at = spotify_cache["updated_at"]
         fail_count = spotify_cache["fail_count"]
         next_retry_at = spotify_cache["next_retry_at"]
-        refreshing = spotify_cache["refreshing"]
         age = now - updated_at if updated_at > 0 else 999999.0
 
-        if age < 2.0 and val is not None:
-            if val.get("isPlaying"):
-                res = dict(val)
-                elapsed_ms = int(age * 1000)
-                res["progressMs"] = min(val.get("progressMs", 0) + elapsed_ms, val.get("durationMs", 0))
-                return res
-            return val
+        is_playing = bool(val and val.get("isPlaying"))
+        duration_ms = val.get("durationMs", 0) if is_playing else 0
+        elapsed_ms = int(age * 1000)
+        curr_progress_ms = (val.get("progressMs", 0) + elapsed_ms) if is_playing else 0
 
-        if age < 15.0 and val is not None:
-            if not refreshing:
-                spotify_cache["refreshing"] = True
-                refresh_executor.submit(refresh_spotify_worker)
-            if val.get("isPlaying"):
+        # Expire cache immediately if song reached duration
+        song_ended = is_playing and (curr_progress_ms >= duration_ms)
+        max_age = 1.5 if is_playing else 4.0
+
+        if not song_ended and age < max_age and val is not None:
+            if is_playing:
                 res = dict(val)
-                elapsed_ms = int(age * 1000)
-                res["progressMs"] = min(val.get("progressMs", 0) + elapsed_ms, val.get("durationMs", 0))
+                res["progressMs"] = min(curr_progress_ms, duration_ms)
                 return res
             return val
 
         if now < next_retry_at and val is not None:
+            if is_playing:
+                res = dict(val)
+                res["progressMs"] = min(curr_progress_ms, duration_ms)
+                return res
             return val
 
         spotify_cache["refreshing"] = True
