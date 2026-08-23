@@ -29,41 +29,66 @@ const formatTime = (ms) => {
   return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
 };
 
+const PRESENCE_LABELS = {
+  online: '● PRESENCE ONLINE',
+  idle: '◐ PRESENCE IDLE',
+  dnd: '● PRESENCE BUSY',
+  offline: '○ PRESENCE OFFLINE'
+};
+
 export const ProfileHeader = ({ personal, presence, weather, showToast, onOpenTerminal, lang }) => {
   const { t } = useI18n(lang);
   const [liveTime, setLiveTime] = useState('');
   const [isPlaying, setIsPlaying] = useState(true);
-  const [spotifyCurrentMs, setSpotifyCurrentMs] = useState(0);
   const [imgError, setImgError] = useState(false);
   const videoRef = useRef(null);
+  const progressRef = useRef(null);
+  const currentTimeRef = useRef(null);
 
   // Reset img error on new track
   useEffect(() => {
     setImgError(false);
   }, [presence.spotify?.song, presence.lastPlayedSpotify?.song]);
 
-  // 10 FPS (100ms) Spotify progress interpolation with CSS transition smoothing
+  // Zero-Rerender High-Performance Spotify progress bar + Time Ticker
   useEffect(() => {
-    if (!presence.spotify?.progressMs) {
-      setSpotifyCurrentMs(0);
+    const spotify = presence.spotify;
+    if (!spotify) {
+      progressRef.current?.style.setProperty('--spotify-progress', '0%');
       return;
     }
-    const startProgress = presence.spotify.progressMs;
-    const startedAt = performance.now();
-    const duration = presence.spotify.durationMs || 0;
-    const update = () => {
-      const elapsed = performance.now() - startedAt;
-      setSpotifyCurrentMs(Math.min(startProgress + elapsed, duration));
-    };
-    update();
-    const timer = setInterval(update, 100);
-    return () => clearInterval(timer);
-  }, [presence.spotify?.progressMs, presence.spotify?.durationMs, presence.spotify?.song]);
 
-  const spotifyProgressPercent =
-    presence.spotify?.durationMs > 0
-      ? Math.min((spotifyCurrentMs / presence.spotify.durationMs) * 100, 100)
-      : 0;
+    const startProgress = Number.isFinite(spotify.progressMs) ? spotify.progressMs : 0;
+    const duration = Number.isFinite(spotify.durationMs) ? spotify.durationMs : 0;
+    const startedAt = performance.now();
+
+    let rafId;
+    let previousSecond = -1;
+
+    const tick = (now) => {
+      const current = Math.min(startProgress + now - startedAt, duration);
+      const percent = duration > 0 ? (current / duration) * 100 : 0;
+
+      if (progressRef.current) {
+        progressRef.current.style.setProperty('--spotify-progress', `${percent}%`);
+      }
+
+      const second = Math.floor(current / 1000);
+      if (second !== previousSecond) {
+        previousSecond = second;
+        if (currentTimeRef.current) {
+          currentTimeRef.current.textContent = formatTime(current);
+        }
+      }
+
+      if (current < duration) {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [presence.spotify?.song, presence.spotify?.progressMs, presence.spotify?.durationMs]);
 
   // Live real clock with seconds (HH:MM:SS)
   useEffect(() => {
@@ -126,19 +151,28 @@ export const ProfileHeader = ({ personal, presence, weather, showToast, onOpenTe
     }
   };
 
+  const presenceLabel =
+    PRESENCE_LABELS[presence.discord_status] ??
+    (presence.isOnline ? '● PRESENCE ONLINE' : '○ PRESENCE OFFLINE');
+
   return (
     <header>
-      {/* Top action bar: Telegram status badge + Server status + Live visitors + Terminal + Theme controls */}
+      {/* Top action bar: Nexus Identity Node + Presence + Server status + Live visitors + Terminal + Theme controls */}
       <div className="card-top-bar">
-        <div
-          className={`status-badge status-${presence.statusType}`}
-          title={presence.isOnline ? t.header.statusOnline : presence.statusText}
-        >
-          <span className={`status-dot status-dot-${presence.statusType}`}></span>
-          <span>{presence.statusText}</span>
+        <div className="node-identity-header font-mono">
+          <span className="node-nexus-badge">NEXUS / IDENTITY</span>
+          <span className="node-num-badge">NODE 01</span>
         </div>
 
         <div className="top-controls">
+          <div
+            className={`status-badge status-${presence.statusType}`}
+            title={presence.isOnline ? t.header.statusOnline : presence.statusText}
+          >
+            <span className={`status-dot status-dot-${presence.statusType}`}></span>
+            <span>{presenceLabel}</span>
+          </div>
+
           <ServerStatusBadge lang={lang} />
           <LiveVisitorsBadge lang={lang} />
 
@@ -249,17 +283,18 @@ export const ProfileHeader = ({ personal, presence, weather, showToast, onOpenTe
                 <ExternalLink size={11} className="activity-ext-icon" />
               </div>
 
-              {/* Ultra-Smooth Real-Time Progress Bar */}
+              {/* Zero-Rerender DOM Progress Bar & Time */}
               {presence.spotify.durationMs > 0 && (
                 <div className="spotify-progress-container">
                   <div className="spotify-progress-bar-bg">
                     <div
+                      ref={progressRef}
                       className="spotify-progress-bar-fill"
-                      style={{ width: `${spotifyProgressPercent}%` }}
+                      style={{ width: 'var(--spotify-progress, 0%)' }}
                     />
                   </div>
                   <div className="spotify-progress-time">
-                    <span>{formatTime(spotifyCurrentMs)}</span>
+                    <span ref={currentTimeRef}>{formatTime(presence.spotify.progressMs || 0)}</span>
                     <span>{formatTime(presence.spotify.durationMs)}</span>
                   </div>
                 </div>

@@ -1,0 +1,45 @@
+/* ==========================================================================
+   MECHTATEL // ECOSYSTEM NEXUS — CANONICAL DESIGN TOKENS
+   Space Infrastructure Terminal Unified Design System
+   ========================================================================== */
+
+:root {
+  /* Surface Architecture */
+  --nx-bg-0: #020304;       /* Deep Void Black (Canvas/Base) */
+  --nx-bg-1: #05070a;       /* Primary Panel / Glass Base */
+  --nx-bg-2: #080b0f;       /* Elevated Surface / Card Base */
+  --nx-bg-3: #0d1218;       /* Highlight / Active Surface */
+
+  /* Text & Alpha Hierarchy */
+  --nx-text-1: rgba(255, 255, 255, 0.96);  /* Primary Text / Headings */
+  --nx-text-2: rgba(255, 255, 255, 0.68);  /* Secondary Text / Subtitles */
+  --nx-text-3: rgba(255, 255, 255, 0.42);  /* Muted Text / Meta Labels */
+  --nx-text-4: rgba(255, 255, 255, 0.24);  /* Subtle / Watermarks */
+
+  /* Structural Borders */
+  --nx-border-1: rgba(255, 255, 255, 0.08); /* Faint Grid / Hairline */
+  --nx-border-2: rgba(255, 255, 255, 0.14); /* Default Card Border */
+  --nx-border-3: rgba(255, 255, 255, 0.28); /* Active / Focus Border */
+
+  /* Subtle Infrastructure Service Accents */
+  --nx-identity: #e4e4e7;        /* Silver / Profile (NX-01) */
+  --nx-network: #dbeafe;         /* Ice / Connectivity (NX-02) */
+  --nx-storage: #cbd5e1;         /* Blue-gray / Nextcloud (NX-03) */
+  --nx-lab: #ddd6fe;             /* Violet-gray / Forgejo (NX-04) */
+  --nx-lab-strong: #c4b5fd;      /* Violet Accent Highlight */
+  --nx-comms: #cffafe;           /* Cyan-gray / Channels (NX-05) */
+  --nx-error: #fca5a5;           /* Muted Red / Lost Route (404) */
+
+  /* Geometry & Corner Radii */
+  --nx-radius-xs: 4px;
+  --nx-radius-sm: 8px;
+  --nx-radius-md: 12px;
+  --nx-radius-lg: 18px;
+  --nx-radius-full: 9999px;
+
+  /* Motion & Easing */
+  --nx-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --nx-fast: 160ms;
+  --nx-normal: 260ms;
+  --nx-slow: 400ms;
+}
