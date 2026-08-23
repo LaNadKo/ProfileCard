@@ -42,23 +42,47 @@ export const ProfileHeader = ({ personal, presence, weather, showToast, onOpenTe
     setImgError(false);
   }, [presence.spotify?.song, presence.lastPlayedSpotify?.song]);
 
-  // 10 FPS (100ms) Spotify progress interpolation with CSS transition smoothing
+  const spotifySyncRef = useRef({ song: null, baseMs: 0, baseTime: 0 });
+
+  // Sync Spotify progress on track change or significant drift
   useEffect(() => {
-    if (!presence.spotify?.progressMs) {
+    if (!presence.spotify?.song || !presence.spotify?.durationMs) {
+      spotifySyncRef.current = { song: null, baseMs: 0, baseTime: 0 };
       setSpotifyCurrentMs(0);
       return;
     }
-    const startProgress = presence.spotify.progressMs;
-    const startedAt = performance.now();
-    const duration = presence.spotify.durationMs || 0;
-    const update = () => {
-      const elapsed = performance.now() - startedAt;
-      setSpotifyCurrentMs(Math.min(startProgress + elapsed, duration));
-    };
-    update();
-    const timer = setInterval(update, 100);
-    return () => clearInterval(timer);
-  }, [presence.spotify?.progressMs, presence.spotify?.durationMs, presence.spotify?.song]);
+
+    const incomingMs = presence.spotify.progressMs || 0;
+    const now = performance.now();
+    const prev = spotifySyncRef.current;
+
+    if (prev.song !== presence.spotify.song) {
+      spotifySyncRef.current = { song: presence.spotify.song, baseMs: incomingMs, baseTime: now };
+      setSpotifyCurrentMs(incomingMs);
+    } else {
+      const estimatedCurrent = prev.baseMs + (now - prev.baseTime);
+      const diff = Math.abs(incomingMs - estimatedCurrent);
+      if (diff > 1500) {
+        spotifySyncRef.current = { song: presence.spotify.song, baseMs: incomingMs, baseTime: now };
+        setSpotifyCurrentMs(incomingMs);
+      }
+    }
+  }, [presence.spotify?.song, presence.spotify?.progressMs, presence.spotify?.durationMs]);
+
+  // Continuous smooth 100ms progress ticker
+  useEffect(() => {
+    if (!presence.spotify?.song || !presence.spotify?.durationMs) return;
+
+    const duration = presence.spotify.durationMs;
+    const interval = setInterval(() => {
+      const { baseMs, baseTime } = spotifySyncRef.current;
+      if (!baseTime) return;
+      const elapsed = performance.now() - baseTime;
+      setSpotifyCurrentMs(Math.min(baseMs + elapsed, duration));
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [presence.spotify?.song, presence.spotify?.durationMs]);
 
   const spotifyProgressPercent =
     presence.spotify?.durationMs > 0

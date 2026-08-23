@@ -615,13 +615,23 @@ def get_spotify_status():
         refreshing = spotify_cache["refreshing"]
         age = now - updated_at if updated_at > 0 else 999999.0
 
-        if age < 5.0 and val is not None:
+        if age < 2.0 and val is not None:
+            if val.get("isPlaying"):
+                res = dict(val)
+                elapsed_ms = int(age * 1000)
+                res["progressMs"] = min(val.get("progressMs", 0) + elapsed_ms, val.get("durationMs", 0))
+                return res
             return val
 
-        if age < 30.0 and val is not None:
+        if age < 15.0 and val is not None:
             if not refreshing:
                 spotify_cache["refreshing"] = True
                 refresh_executor.submit(refresh_spotify_worker)
+            if val.get("isPlaying"):
+                res = dict(val)
+                elapsed_ms = int(age * 1000)
+                res["progressMs"] = min(val.get("progressMs", 0) + elapsed_ms, val.get("durationMs", 0))
+                return res
             return val
 
         if now < next_retry_at and val is not None:
