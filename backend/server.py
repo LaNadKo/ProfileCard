@@ -532,6 +532,15 @@ def get_spotify_status():
             }
 
             save_last_played(track_info)
+            now_ts = int(time.time())
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now_ts), str(now_ts)))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
             return track_info
     except Exception:
         return {"isPlaying": False, "lastPlayed": last_played}
@@ -706,36 +715,59 @@ def get_system_status():
     }
 
 def get_last_seen():
-    if not DISCORD_USER_ID:
-        return {"lastSeenTimestamp": int(time.time())}
-    try:
-        req = urllib.request.Request(
-            f"{LANYARD_REST_BASE_URL}/{urllib.parse.quote(DISCORD_USER_ID)}",
-            headers={"User-Agent": OUTBOUND_USER_AGENT}
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get("success"):
-                d = data.get("data", {})
-                discord_status = d.get("discord_status", "offline")
-                is_online = discord_status in ["online", "idle", "dnd"]
-                now = int(time.time())
+    now = int(time.time())
+    is_discord_online = False
+    if DISCORD_USER_ID:
+        try:
+            req = urllib.request.Request(
+                f"{LANYARD_REST_BASE_URL}/{urllib.parse.quote(DISCORD_USER_ID)}",
+                headers={"User-Agent": OUTBOUND_USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                if data.get("success"):
+                    d = data.get("data", {})
+                    discord_status = d.get("discord_status", "offline")
+                    is_discord_online = discord_status in ["online", "idle", "dnd"]
+        except Exception:
+            pass
 
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                if is_online:
-                    c.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now), str(now)))
-                    conn.commit()
-                    conn.close()
-                    return {"isOnline": True, "lastSeenTimestamp": now}
-                else:
-                    c.execute("SELECT val FROM presence_state WHERE key = 'last_seen_ts'")
-                    row = c.fetchone()
-                    conn.close()
-                    last_ts = int(row[0]) if row else (now - LAST_SEEN_FALLBACK_SECONDS)
-                    return {"isOnline": False, "lastSeenTimestamp": last_ts}
+    is_spotify_online = False
+    if not is_discord_online and CLIENT_ID and REFRESH_TOKEN:
+        try:
+            spot = get_spotify_status()
+            is_spotify_online = bool(spot.get("isPlaying"))
+        except Exception:
+            pass
+
+    is_online = is_discord_online or is_spotify_online
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if is_online:
+            c.execute("INSERT INTO presence_state (key, val) VALUES ('last_seen_ts', ?) ON CONFLICT(key) DO UPDATE SET val = ?", (str(now), str(now)))
+            conn.commit()
+            conn.close()
+            return {"isOnline": True, "lastSeenTimestamp": now}
+        else:
+            c.execute("SELECT key, val FROM presence_state WHERE key IN ('last_seen_ts', 'last_played_track')")
+            rows = dict(c.fetchall())
+            conn.close()
+            last_ts = int(rows.get('last_seen_ts', 0)) if rows.get('last_seen_ts') else 0
+            if 'last_played_track' in rows:
+                try:
+                    lp = json.loads(rows['last_played_track'])
+                    lp_ts = int(lp.get('playedAtTimestamp', 0))
+                    last_ts = max(last_ts, lp_ts)
+                except Exception:
+                    pass
+            if not last_ts:
+                last_ts = now - LAST_SEEN_FALLBACK_SECONDS
+            return {"isOnline": False, "lastSeenTimestamp": last_ts}
     except Exception:
         pass
+
     return {"isOnline": False, "lastSeenTimestamp": int(time.time() - LAST_SEEN_FALLBACK_SECONDS)}
 
 def get_guestbook_messages(client_ip):
@@ -1180,7 +1212,12 @@ class UnifiedHandler(http.server.SimpleHTTPRequestHandler):
         user_agent = self.headers.get("User-Agent", "")
 
         record_unique_visit(client_ip, user_agent)
-        active_count = record_visitor_heartbeat(client_ip, visitor_id)
+        if path == "/api/live-visitors" or visitor_id:
+            active_count = record_visitor_heartbeat(client_ip, visitor_id)
+        else:
+            with visitors_lock:
+                cutoff = time.time() - ACTIVE_VISITOR_TTL_SECONDS
+                active_count = len([k for k, ts in ACTIVE_VISITORS.items() if ts >= cutoff])
 
         if path in ["", "/api/spotify-status", "/api/spotify", "/api/spotify/playing", "/api/spotify/current"]:
             result = get_spotify_status()

@@ -246,7 +246,12 @@ export function usePresence({ discordUserId, lang = 'ru' }) {
   // Combined Presence Computation
   const isOnline = discordState.online || spotifyState.isPlaying || Boolean(discordState.game);
   const statusType = isOnline ? 'online' : 'offline';
-  const statusText = isOnline ? 'Online' : formatTelegramLastSeen(lastSeenTimestamp, lang);
+
+  const effectiveLastSeen = Math.max(
+    Number(lastSeenTimestamp) || 0,
+    Number(spotifyState.lastPlayed?.playedAtTimestamp) || 0
+  );
+  const statusText = isOnline ? 'Online' : formatTelegramLastSeen(effectiveLastSeen, lang);
 
   const isLastPlayedValid = Boolean(
     spotifyState.lastPlayed &&
